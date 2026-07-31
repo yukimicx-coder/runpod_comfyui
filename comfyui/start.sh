@@ -1,0 +1,112 @@
+#!/bin/bash
+set -e # Exit the script if any statement returns a non-true return value
+
+# ---------------------------------------------------------------------------- #
+#                          Function Definitions                                #
+# ---------------------------------------------------------------------------- #
+
+# Start nginx service
+start_nginx() {
+    echo "Starting Nginx service..."
+    service nginx start
+}
+
+# Execute script if exists
+execute_script() {
+    local script_path=$1
+    local script_msg=$2
+    if [[ -f ${script_path} ]]; then
+        echo "${script_msg}"
+        bash "${script_path}"
+    fi
+}
+
+# Setup ssh
+setup_ssh() {
+    if [[ $PUBLIC_KEY ]]; then
+        echo "Setting up SSH..."
+        echo "$PUBLIC_KEY" >> ~/.ssh/authorized_keys
+        chmod 0600 ~/.ssh/authorized_keys
+
+        if [[ ! -f /etc/ssh/ssh_host_rsa_key ]]; then
+            ssh-keygen -t rsa -f /etc/ssh/ssh_host_rsa_key -q -N ''
+            echo "RSA key fingerprint:"
+            ssh-keygen -lf /etc/ssh/ssh_host_rsa_key.pub
+        fi
+
+        #if [[ ! -f /etc/ssh/ssh_host_dsa_key ]]; then
+        #    ssh-keygen -t dsa -f /etc/ssh/ssh_host_dsa_key -q -N ''
+        #    echo "DSA key fingerprint:"
+        #    ssh-keygen -lf /etc/ssh/ssh_host_dsa_key.pub
+        #fi
+
+        if [[ ! -f /etc/ssh/ssh_host_ecdsa_key ]]; then
+            ssh-keygen -t ecdsa -f /etc/ssh/ssh_host_ecdsa_key -q -N ''
+            echo "ECDSA key fingerprint:"
+            ssh-keygen -lf /etc/ssh/ssh_host_ecdsa_key.pub
+        fi
+
+        if [[ ! -f /etc/ssh/ssh_host_ed25519_key ]]; then
+            ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -q -N ''
+            echo "ED25519 key fingerprint:"
+            ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
+        fi
+
+        service ssh start
+
+        echo "SSH host keys:"
+        for key in /etc/ssh/*.pub; do
+            echo "Key: $key"
+            ssh-keygen -lf "$key"
+        done
+    fi
+}
+
+# Export env vars
+export_env_vars() {
+    echo "Exporting environment variables..."
+    printenv | grep -E '^[A-Z_][A-Z0-9_]*=' | grep -v '^PUBLIC_KEY' | awk -F = '{ val = $0; sub(/^[^=]*=/, "", val); print "export " $1 "=\"" val "\"" }' > /etc/rp_environment
+    if ! grep -q 'source /etc/rp_environment' ~/.bashrc; then
+        echo 'source /etc/rp_environment' >> ~/.bashrc
+    fi
+}
+
+# Start jupyter lab
+start_jupyter() {
+    if [[ $JUPYTER_PASSWORD ]]; then
+        echo "Starting Jupyter Lab..."
+        mkdir -p /workspace &&
+            cd / &&
+            nohup python -m jupyter lab --allow-root --no-browser --port=8888 --ip=* --FileContentsManager.delete_to_trash=False --ServerApp.terminado_settings='{"shell_command":["/bin/bash"]}' --IdentityProvider.token="$JUPYTER_PASSWORD" --ServerApp.allow_origin=* --ServerApp.preferred_dir=/workspace &> /jupyter.log &
+            JUPYTER_PID=$!
+            sleep 2
+            if kill -0 "$JUPYTER_PID" 2>/dev/null; then
+                echo "Jupyter Lab started (pid=$JUPYTER_PID)"
+            else
+                echo "Jupyter Lab FAILED to start. /jupyter.log:" >&2
+                cat /jupyter.log >&2
+                return 1
+            fi
+    fi
+}
+
+# ---------------------------------------------------------------------------- #
+#                               Main Program                                   #
+# ---------------------------------------------------------------------------- #
+
+#start_nginx
+
+execute_script "/pre_start.sh" "Running pre-start script..."
+
+echo "Pod Started"
+
+setup_ssh
+start_jupyter
+export_env_vars
+
+echo "Start script(s) finished, Pod is ready to use."
+
+execute_script "/post_start.sh" "Running post-start script..."
+
+comfyui_launcher.sh
+exec tail -F /root/comfy/ComfyUI/user/comfyui_8188.log
