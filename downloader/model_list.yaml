@@ -1,49 +1,27 @@
 - type: civitai
-  version-id: 3091374
-  ldir: loras
-  comment: UltraReal KR2_V1
-
-- type: civitai
-  version-id: 3084537
-  ldir: loras
-  overwrite: true
-  lfile: realisticSnapshot_v05.safetensors
-  comment: Realistic Snapshot Krea2(v0.5)
+  version-id: 2681234
+  file-index: 1
+  ldir: checkpoints
+  comment: Cyberrealistic Final
+  skip: false
 
 - type: hf
-  repo: Kijai/WanVideo_comfy
-  file: LoRAs/Wan22-Lightning/old/Wan2.2-Lightning_T2V-A14B-4steps-lora_HIGH_fp16.safetensors
+  repo: latent-consistency/lcm-lora-sdv1-5
+  file: pytorch_lora_weights.safetensors
   ldir: loras
-
-- type: hf
-  repo: Kijai/WanVideo_comfy
-  subdir: LoRAs/Wan22-Lightning/old 
-  file: Wan2.2-Lightning_T2V-A14B-4steps-lora_LOW_fp16.safetensors
-  ldir: loras
+  lfile: sd15_lcm_lora.safetensors
+  skip: false
 
 - type: hf
   repo: Comfy-Org/Krea-2
-  file: diffusion_models/krea2_turbo_fp8_scaled.safetensors
-  ldir: .
-  skip: true
-
-- type: civitai
-  version-id: 3139241
+  subdir: diffusion_models
+  file: krea2_turbo_fp8_scaled.safetensors
   ldir: diffusion_models
-  comment: Krea2-RED-Mix2 赤佬版 17/07/2026
-  skip: true
-
-- type: civitai
-  version-id: 3112728
-  ldir: diffusion_models
-  comment: LUSTIFY! v10
-  skip: true
+  skip: false
 
 - type: hf
   repo: black-forest-labs/FLUX.2-klein-9b-fp8
   file: flux-2-klein-9b-fp8.safetensors
   ldir: diffusion_models
-  skip: true
-
-  
+  skip: false
 

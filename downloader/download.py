@@ -8,6 +8,8 @@ import time
 from tqdm.auto import tqdm
 import shutil
 
+os.environ["HF_HOME"] = "/workspace/.cache/hf"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 from huggingface_hub import hf_hub_download, HfApi
@@ -18,6 +20,11 @@ import traceback
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 lh = logging.StreamHandler()
+logger.addHandler(lh)
+
+model_downloader_log=os.environ.get("MODEL_DL_LOG", "/workspace/model_dl.log")
+lh = logging.FileHandler(model_downloader_log)
+lh.setFormatter(logging.Formatter('[%(levelname)s] - (%(asctime)s) - %(message)s'))
 logger.addHandler(lh)
 
 CIVITAI_KEY=os.environ.get("CIVITAI_KEY", "")
@@ -108,7 +115,7 @@ RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 MAX_RETRY=3
 CHUNK_SIZE=8192
 def download_from_civitai(model_inf:dict):
-    url_path = f"/model-versions/mini/{model_inf['version-id']}"
+    url_path = f"/model-versions/{model_inf['version-id']}"
     headers = {"Authorization": f"Bearer {CIVITAI_KEY}"}
 
     logger.debug("civitai: start get info: %s", url_path)
@@ -122,10 +129,23 @@ def download_from_civitai(model_inf:dict):
         return model_inf
 
     versions_data = response.json()
-    # 最初に見つかったファイルのダウンロードリンクを取得
-    # 量子化の違うファイル取得にはminiじゃないフル情報が必要になる
-    file_url = versions_data["downloadUrls"][0]
-    model_inf["file"] = versions_data['fileName']
+    file_index = 0
+    if "file-index" in model_inf:
+        file_index = int(model_inf["file-index"])
+    elif len(versions_data["files"]) > 1:
+        fp_list = {}
+        for i,f in enumerate(versions_data["files"]):
+            fp_list[f["metadata"]["fp"]] = i
+        file_index = fp_list.get("fp8",
+                        fp_list.get("int8",
+                            fp_list.get("bf16",
+                                fp_list.get("fp16", 0))))
+
+
+    file_info = versions_data["files"][file_index]
+
+    file_url = file_info["downloadUrl"]
+    model_inf["file"] = file_info['name']
 
     local_dir = os.path.join(models_root, model_inf["ldir"])
     os.makedirs(local_dir, exist_ok=True)
@@ -134,7 +154,7 @@ def download_from_civitai(model_inf:dict):
 
     if os.path.isfile(save_path):
         if not model_inf.get("overwrite", False):
-            if compare_hashes(save_path, versions_data["hashes"]["SHA256"]):
+            if compare_hashes(save_path, file_info["hashes"]["SHA256"]):
                 model_inf["result"] = "同一ファイルスキップ"
                 return model_inf
 
@@ -179,7 +199,7 @@ def download_from_civitai(model_inf:dict):
                             f.write(chunk)            # ファイルに書き込み
                             sha256_hash.update(chunk) # 同時にハッシュを更新
 
-                orig_hash = versions_data["hashes"]["SHA256"].lower()
+                orig_hash = file_info["hashes"]["SHA256"].lower()
                 this_hash = sha256_hash.hexdigest().lower()
                 if orig_hash == this_hash:
                     shutil.move(partial_path, save_path)
