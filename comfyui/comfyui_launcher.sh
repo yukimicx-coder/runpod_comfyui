@@ -1,5 +1,7 @@
 #!/usr/bin/bash
 
+pushd ~/comfy
+
 COMFY_CLI="uv run comfy"
 
 _bg=--background
@@ -39,7 +41,7 @@ while [ -n "$1" ]; do
 done
 
 check_status() {
-    python -c "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:$_port/').getcode() == 200 else 1)" > /dev/null 2>&1
+    uv run python -c "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:$_port/').getcode() == 200 else 1)" > /dev/null 2>&1
 }
 
 if check_status; then
@@ -64,3 +66,6 @@ fi
 
 
 $COMFY_CLI --recent launch $_bg -- $_cpu $_verbose $_listen --port $_port
+
+popd
+
