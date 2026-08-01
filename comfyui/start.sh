@@ -5,22 +5,6 @@ set -e # Exit the script if any statement returns a non-true return value
 #                          Function Definitions                                #
 # ---------------------------------------------------------------------------- #
 
-# Start nginx service
-start_nginx() {
-    echo "Starting Nginx service..."
-    service nginx start
-}
-
-# Execute script if exists
-execute_script() {
-    local script_path=$1
-    local script_msg=$2
-    if [[ -f ${script_path} ]]; then
-        echo "${script_msg}"
-        bash "${script_path}"
-    fi
-}
-
 # Setup ssh
 setup_ssh() {
     if [[ $PUBLIC_KEY ]]; then
@@ -28,29 +12,7 @@ setup_ssh() {
         echo "$PUBLIC_KEY" >> ~/.ssh/authorized_keys
         chmod 0600 ~/.ssh/authorized_keys
 
-        if [[ ! -f /etc/ssh/ssh_host_rsa_key ]]; then
-            ssh-keygen -t rsa -f /etc/ssh/ssh_host_rsa_key -q -N ''
-            echo "RSA key fingerprint:"
-            ssh-keygen -lf /etc/ssh/ssh_host_rsa_key.pub
-        fi
-
-        #if [[ ! -f /etc/ssh/ssh_host_dsa_key ]]; then
-        #    ssh-keygen -t dsa -f /etc/ssh/ssh_host_dsa_key -q -N ''
-        #    echo "DSA key fingerprint:"
-        #    ssh-keygen -lf /etc/ssh/ssh_host_dsa_key.pub
-        #fi
-
-        if [[ ! -f /etc/ssh/ssh_host_ecdsa_key ]]; then
-            ssh-keygen -t ecdsa -f /etc/ssh/ssh_host_ecdsa_key -q -N ''
-            echo "ECDSA key fingerprint:"
-            ssh-keygen -lf /etc/ssh/ssh_host_ecdsa_key.pub
-        fi
-
-        if [[ ! -f /etc/ssh/ssh_host_ed25519_key ]]; then
-            ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -q -N ''
-            echo "ED25519 key fingerprint:"
-            ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
-        fi
+        ssh-keygen -A
 
         service ssh start
 
@@ -71,42 +33,61 @@ export_env_vars() {
     fi
 }
 
-# Start jupyter lab
-start_jupyter() {
-    if [[ $JUPYTER_PASSWORD ]]; then
-        echo "Starting Jupyter Lab..."
-        mkdir -p /workspace &&
-            cd / &&
-            nohup python -m jupyter lab --allow-root --no-browser --port=8888 --ip=* --FileContentsManager.delete_to_trash=False --ServerApp.terminado_settings='{"shell_command":["/bin/bash"]}' --IdentityProvider.token="$JUPYTER_PASSWORD" --ServerApp.allow_origin=* --ServerApp.preferred_dir=/workspace &> /jupyter.log &
-            JUPYTER_PID=$!
-            sleep 2
-            if kill -0 "$JUPYTER_PID" 2>/dev/null; then
-                echo "Jupyter Lab started (pid=$JUPYTER_PID)"
-            else
-                echo "Jupyter Lab FAILED to start. /jupyter.log:" >&2
-                cat /jupyter.log >&2
-                return 1
-            fi
-    fi
-}
+prepare_comfyui() {
+    if [ ! -d ~/comfy ]; then
+        archive_file=/workspace/ComfyUI-latest.tar.gz
+        if [ ! -f "$archive_file" ]; then
+            echo "ComfyUI archive file missing"
+            exit 1
+        fi
 
+        echo "extracting ComfyUI archive..."
+        tar xzf "$archive_file" -C ~/
+
+        if [ ! -f ~/comfy/ComfyUI/main.py ]; then
+            echo "Failed to extract ComfyUI"
+            exit 2
+        fi
+    fi
+
+    _COMFY_ROOT=~/comfy/ComfyUI
+    _MOUNT_ROOT=/workspace
+
+    replace_dir_to_link() {
+        if [ -d "$_COMFY_ROOT/$1" ]; then
+            rm -rf "$_COMFY_ROOT/$1"
+        fi
+        ln -sf "$_MOUNT_ROOT/$1" "$_COMFY_ROOT/$1"
+    }
+
+    for dir in custom_nodes models output input user; do
+        replace_dir_to_link $dir
+    done
+
+    echo "update dependecies..."
+    pushd ~/comfy
+    uv run comfy --here --where local --skip-prompt install --restore --fast-deps --nvidia --cuda-version 13.0
+    popd
+
+
+}
 # ---------------------------------------------------------------------------- #
 #                               Main Program                                   #
 # ---------------------------------------------------------------------------- #
 
-#start_nginx
-
-execute_script "/pre_start.sh" "Running pre-start script..."
-
 echo "Pod Started"
 
 setup_ssh
-start_jupyter
 export_env_vars
 
 echo "Start script(s) finished, Pod is ready to use."
 
-execute_script "/post_start.sh" "Running post-start script..."
+prepare_comfyui
 
 comfyui_launcher.sh
+
+if [ -x /post_start.sh ]; then
+    /post_start.sh
+fi
+
 exec tail -F /root/comfy/ComfyUI/user/comfyui_8188.log

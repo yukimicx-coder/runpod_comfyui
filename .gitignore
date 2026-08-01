@@ -2,3 +2,4 @@ workspace/
 comfyui/authorized_keys
 downloader/.env
 comfyui/.env
+comfyui/output/
