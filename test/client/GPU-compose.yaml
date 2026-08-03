@@ -1,0 +1,9 @@
+services:
+  local:
+    container_name: local_GPU
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+

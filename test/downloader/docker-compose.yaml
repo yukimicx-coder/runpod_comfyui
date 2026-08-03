@@ -1,0 +1,35 @@
+name: RunPod_test_downloader
+services:
+  downloader:
+    image: ghcr.io/yukimicx-coder/runpod_comfyui_ready:latest
+    container_name: runpod_downloader
+    hostname: downloader
+    restart: unless-stopped
+    working_dir: /root/comfy
+    environment:
+      - PUBLIC_KEY=${PUBLIC_KEY}
+      - HF_TOKEN=${HF_TOKEN}
+      - CIVITAI_API_TOKEN=${CIVITAI_API_TOKEN}
+      - CIVITAI_API_URL=${CIVITAI_API_URL:-https://civitai.com/api/v1}
+
+      - NO_COMFYUI=1
+      - NETDRV_SCRIPT=run_download.sh
+
+    ports:
+      - "127.0.0.1:2422:22"
+    #extra_hosts:
+    #  - "host.docker.internal:host-gateway"
+    volumes:
+      # network volume
+      - type: bind
+        source: ${WORKSPACE:-./workspace}
+        target: /workspace
+
+    networks:
+      - comfy_net
+
+    init: true
+
+networks:
+  comfy_net:
+    external: true

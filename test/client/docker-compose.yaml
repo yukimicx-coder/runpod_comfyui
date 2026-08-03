@@ -1,0 +1,60 @@
+name: RunPod_test_client
+services:
+  local:
+    image: ghcr.io/yukimicx-coder/runpod_comfyui_ready:latest
+    container_name: comfyui_local
+    hostname: client
+    restart: unless-stopped
+    working_dir: /root
+    environment:
+      - COMFY_LISTEN=0.0.0.0
+      - COMFYCLI_TAG=${COMFYCLI_TAG}
+      - COMFYCLI_CUDA=${COMFYCLI_CUDA}
+      - USE_NETDRV_COMFYUI=1
+      - MY_NODES_VERBOSE=1
+      # Secret
+      - PUBLIC_KEY=${PUBLIC_KEY}
+      - SSH_KEY_PASSWORD=${SSH_KEY_PASSWORD}
+
+      # for GUI
+      - "DISPLAY=:0"
+      - WAYLAND_DISPLAY=wayland-0
+      - XDG_RUNTIME_DIR=/mnt/host/wslg/runtime-dir
+      - PULSE_SERVER=unix:/mnt/host/wslg/PulseServer
+      - LD_LIBRARY_PATH=/usr/lib/wsl/lib
+    ports:
+      - "127.0.0.1:8188:8188"
+      - "127.0.0.1:2222:22"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # network volume
+      - type: bind
+        source: ${WORKSPACE:-./workspace}
+        target: /workspace
+
+      # SSH
+      - type: bind
+        source: ./ssh
+        target: /root/.ssh
+
+      # Script
+      - type: bind
+        source: ./post_start.sh
+        target: /workspace/post_start.sh
+
+      # for GUI
+      - //tmp/.X11-unix:/tmp/.X11-unix
+      - //mnt/wslg:/mnt/wslg
+      - //usr/lib/wsl:/usr/lib/wsl
+    devices:
+      - //dev/dxg:/dev/dxg
+
+    networks:
+      - comfy_net
+
+    init: true
+
+networks:
+  comfy_net:
+    external: true

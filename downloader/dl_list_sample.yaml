@@ -1,0 +1,42 @@
+sd15:
+  disabled: false
+  files: 
+    - type: civitai
+      version-id: 2681234
+      file-index: 1
+      ldir: checkpoints
+      comment: Cyberrealistic Final
+
+    - type: hf
+      repo: latent-consistency/lcm-lora-sdv1-5
+      file: pytorch_lora_weights.safetensors
+      ldir: loras
+      lfile: sd15_lcm_lora.safetensors
+
+flux2:
+  disabled: false
+  files:
+    - type: civitai
+      version-id: 2658598
+      ldir: diffusion_models
+      lfile: flux-2-klein-9b-fp8.safetensors
+
+
+krea2:
+  disabled: true
+  files:
+    - type: hf
+      repo: Comfy-Org/Krea-2
+      subdir: diffusion_models
+      file: krea2_turbo_fp8_scaled.safetensors
+      ldir: diffusion_models
+
+ltx23:
+  disabled: true
+  files:
+    - type: hf
+      repo: Kijai/LTX2.3_comfy
+      subdir: diffusion_models
+      file: ltx-2.3-22b-distilled-1.1_transformer_only_fp8_scaled.safetensors
+      ldir: diffusion_models
+

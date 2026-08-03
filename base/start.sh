@@ -33,44 +33,7 @@ export_env_vars() {
     fi
 }
 
-prepare_comfyui() {
-    if [ ! -d ~/comfy ]; then
-        archive_file=/workspace/ComfyUI-latest.tar.gz
-        if [ ! -f "$archive_file" ]; then
-            echo "ComfyUI archive file missing"
-            exit 1
-        fi
 
-        echo "extracting ComfyUI archive..."
-        tar xzf "$archive_file" -C ~/
-
-        if [ ! -f ~/comfy/ComfyUI/main.py ]; then
-            echo "Failed to extract ComfyUI"
-            exit 2
-        fi
-    fi
-
-    _COMFY_ROOT=~/comfy/ComfyUI
-    _MOUNT_ROOT=/workspace
-
-    replace_dir_to_link() {
-        if [ -d "$_COMFY_ROOT/$1" ]; then
-            rm -rf "$_COMFY_ROOT/$1"
-        fi
-        ln -sf "$_MOUNT_ROOT/$1" "$_COMFY_ROOT/$1"
-    }
-
-    for dir in custom_nodes models output input user; do
-        replace_dir_to_link $dir
-    done
-
-    echo "update dependecies..."
-    pushd ~/comfy
-    uv run comfy --here --where local --skip-prompt install --restore --fast-deps --nvidia --cuda-version 13.0
-    popd
-
-
-}
 # ---------------------------------------------------------------------------- #
 #                               Main Program                                   #
 # ---------------------------------------------------------------------------- #
@@ -82,12 +45,20 @@ export_env_vars
 
 echo "Start script(s) finished, Pod is ready to use."
 
-prepare_comfyui
+if [ -z "$NO_COMFYUI" ]; then
+    ~/comfy/setup_comfyui.sh
+    comfyui_launcher.sh
+fi
 
-comfyui_launcher.sh
+# end of 'set -e'
+set +e 
 
-if [ -x /post_start.sh ]; then
-    /post_start.sh
+if [ -f "/workspace/post_start.sh" ]; then
+    bash "/workspace/post_start.sh"
+fi
+
+if [ -n "$MODEL_DL_AUTO_START" ]; then
+    run_download.sh &
 fi
 
 exec tail -F /root/comfy/ComfyUI/user/comfyui_8188.log

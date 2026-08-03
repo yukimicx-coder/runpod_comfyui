@@ -1,0 +1,9 @@
+services:
+  remote:
+    container_name: remote_GPU
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+

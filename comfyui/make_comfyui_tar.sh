@@ -1,18 +1,14 @@
 #!/bin/bash
+
+# run this scropt on the container that ComfyUI is already installed.
+
 set -e # Exit the script if any statement returns a non-true return value
 
-mkdir -p ~/comfy
-cd ~/comfy
-
-# comfy-cli needs venv
-uv venv --no-managed-python --no-python-downloads --seed .venv
-
-uv pip install comfy-cli
-uv run comfy tracking disable 
+pushd ~/comfy
 
 _restore_opt=
 if [ -f ComfyUI/main.py ]; then
-    echo "ComfyUI already exists. using restore"
+    echo "ComfyUI already exists. use --restore option"
     _restore_opt=--restore
 fi
 
@@ -20,7 +16,7 @@ uv run comfy --here --where local --skip-prompt install $_restore_opt --fast-dep
         --cuda-version ${COMFYCLI_CUDA} --version ${COMFYCLI_TAG}
 uv cache clear
 
-cd ~
+popd
 
-echo "start archiving comfy/* ..."
-tar czf /run/output/ComfyUI-v${COMFYCLI_TAG}.tar.gz comfy
+echo "start archiving comfy to /workspace ..."
+tar czf /workspace/ComfyUI_v${COMFYCLI_TAG}_cu${COMFYCLI_CUDA}.tar.gz ~/comfy
