@@ -2,13 +2,14 @@ import argparse
 import hashlib
 import logging
 import os
-import requests
 import shutil
 import sys
 import time
 import traceback
-import yaml
 from concurrent.futures import ThreadPoolExecutor
+
+import httpx
+import yaml
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -16,7 +17,7 @@ load_dotenv()
 # HF_XET_HIGH_PERFORMANCE = 1 causes many promblems, use it at your own risk
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import HfApi
 
 #
 # Customizable Environment variable
@@ -55,12 +56,12 @@ def compare_hashes(local_path, hash_hex:str):
     #logger.debug(f"orig={orig_hash}, this={this_hash}")
     return this_hash == orig_hash
 
-def hf_get_path_info(kwargs):
+def hf_get_path_info(repo_id, filename, subfolder=None):
     hf_api = HfApi()
-    file_path = kwargs["filename"]
-    if "subfolder" in kwargs:
-        file_path = os.path.join(kwargs["subfolder"], file_path)
-    return hf_api.get_paths_info(repo_id=kwargs["repo_id"], paths=[file_path])[0]
+    file_path = filename
+    if subfolder:
+        file_path = os.path.join(subfolder, file_path)
+    return hf_api.get_paths_info(repo_id=repo_id, paths=[file_path])[0]
 
 def _update_file_state(model_inf:dict, remote_hash:str):
     if os.path.isfile(model_inf["saved_as"]):
@@ -74,19 +75,67 @@ def _update_file_state(model_inf:dict, remote_hash:str):
     if model_inf["state"] == "same" and not model_inf.get("overwrite", False):
         model_inf["result"] = "info: skip same file"
 
-def download_from_hf(model_inf:dict, do_not_dl:bool):
-    kwargs = {
-        "repo_id": model_inf["repo"],
-        "filename": model_inf['file'],
-    }
+def _download_file(url: str, headers: dict, saved_as: str, expected_sha256: str | None = None) -> str:
+    partial_path = saved_as + PARTIAL_SUFFIX
 
+    sha256_hash = hashlib.sha256()
+    if os.path.isfile(partial_path):
+        with open(partial_path, "rb") as f:
+            while chunk := f.read(CHUNK_SIZE):
+                sha256_hash.update(chunk)
+
+    with httpx.Client(timeout=30, follow_redirects=True) as client:
+        for retry_count in range(MAX_RETRY):
+            req_headers = dict(headers)
+            part_len = 0
+            if os.path.isfile(partial_path):
+                part_len = os.path.getsize(partial_path)
+                req_headers["Range"] = f'bytes={part_len}-'
+
+            try:
+                with client.stream("GET", url, headers=req_headers) as response:
+                    response.raise_for_status()
+
+                    if response.status_code == 206:
+                        mode = 'ab'
+                    else:
+                        if part_len > 0:
+                            sha256_hash = hashlib.sha256()
+                        mode = 'wb'
+
+                    with open(partial_path, mode) as f:
+                        for chunk in response.iter_bytes(chunk_size=CHUNK_SIZE):
+                            if chunk:
+                                f.write(chunk)
+                                sha256_hash.update(chunk)
+
+                    if expected_sha256 and expected_sha256.lower() != sha256_hash.hexdigest().lower():
+                        return f"error: hash mismatch {expected_sha256} != {sha256_hash.hexdigest()}"
+
+                    shutil.move(partial_path, saved_as)
+                    return "success"
+
+            except httpx.HTTPStatusError as e:
+                stc = e.response.status_code
+                if stc not in RETRY_STATUS_CODES:
+                    return "error: " + traceback.format_exc()
+
+                if retry_count == (MAX_RETRY - 1):
+                    return "error: retry count reached limit: " + traceback.format_exc()
+
+                logger.warning("retryable error: will be resumed after 20 sec.\n\n %s: %s", stc, e)
+                time.sleep(20)
+                continue
+
+            except Exception:
+                return "error: " + traceback.format_exc()
+
+    return "error: unexpected error"
+
+def download_from_hf(model_inf:dict, do_not_dl:bool):
     if model_inf.get("result"):
-        # phase2
         if model_inf["result"] != "success":
             return model_inf
-        kwargs["local_dir"] = os.path.dirname(model_inf["saved_as"])
-        if model_inf.get("subdir"):
-            kwargs["subfolder"] = model_inf["subdir"]
     else:
         if "/" in model_inf['file']:
             sub_dir = os.path.dirname(model_inf["file"])
@@ -97,19 +146,21 @@ def download_from_hf(model_inf:dict, do_not_dl:bool):
 
         local_dir = os.path.join(MODEL_DL_ROOT, model_inf["ldir"])
         os.makedirs(local_dir, exist_ok=True)
-        kwargs["local_dir"] = local_dir
-
-        if model_inf.get("subdir"):
-            kwargs["subfolder"] = model_inf["subdir"]
 
         model_inf["saved_as"] = os.path.join(local_dir, model_inf.get("lfile", model_inf["file"]))
 
-        logger.info("## hf: get file info: %s", kwargs["filename"])
-        path_info = hf_get_path_info(kwargs)
+        logger.info("## hf: get file info: %s", model_inf['file'])
+        path_info = hf_get_path_info(model_inf["repo"], model_inf["file"], model_inf.get("subdir"))
         remote_hash = None
         if path_info.lfs:
             remote_hash = path_info.lfs["sha256"].lower()
+        model_inf["sha256"] = remote_hash
         model_inf["sizeKiB"] = path_info.size/1024.0
+
+        url_path = model_inf.get("subdir", "")
+        if url_path:
+            url_path += "/"
+        model_inf["file_url"] = f"https://huggingface.co/{model_inf['repo']}/resolve/main/{url_path}{model_inf['file']}"
 
         _update_file_state(model_inf, remote_hash)
         if model_inf.get("result", "") == "info: skip same file":
@@ -119,22 +170,14 @@ def download_from_hf(model_inf:dict, do_not_dl:bool):
         model_inf["result"] = "success"
         return model_inf
 
-    kwargs["local_dir_use_symlinks"] = False
+    headers = {}
+    hf_token = os.environ.get("HF_TOKEN")
+    if hf_token:
+        headers["Authorization"] = f"Bearer {hf_token}"
 
     logger.info("## hf start downloading: %s", model_inf['file'])
-    try:
-        # 個別ファイルをダウンロード
-        dl_path = hf_hub_download(**kwargs)
-
-        if model_inf["saved_as"] != dl_path:
-            shutil.move(dl_path, model_inf["saved_as"])
-
-        model_inf["result"] = "success"
-        return model_inf
-
-    except Exception as e:
-        model_inf["result"] = "error: " + traceback.format_exc()
-        return model_inf
+    model_inf["result"] = _download_file(model_inf["file_url"], headers, model_inf["saved_as"], model_inf.get("sha256"))
+    return model_inf
 
 RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 MAX_RETRY=3
@@ -142,10 +185,12 @@ CHUNK_SIZE=100*1024*1024
 PARTIAL_SUFFIX=".partial"
 
 def download_from_civitai(model_inf:dict, do_not_dl:bool):
-    headers = {"Authorization": f"Bearer {os.environ.get('CIVITAI_API_TOKEN', '')}"}
+    headers = {}
+    civitai_token = os.environ.get("CIVITAI_API_TOKEN")
+    if civitai_token:
+        headers["Authorization"] = f"Bearer {civitai_token}"
 
     if model_inf.get("result"):
-        # phase2
         if model_inf["result"] != "success":
             return model_inf
     else:
@@ -155,9 +200,9 @@ def download_from_civitai(model_inf:dict, do_not_dl:bool):
 
         try:
             url = CIVITAI_API_URL + url_path
-            response = requests.get(url, headers=headers)
+            response = httpx.get(url, headers=headers)
             response.raise_for_status()
-        except Exception as e:
+        except Exception:
             model_inf["result"] = "error: " + traceback.format_exc()
             return model_inf
 
@@ -179,7 +224,7 @@ def download_from_civitai(model_inf:dict, do_not_dl:bool):
 
         model_inf["file"] = file_info['name']
         model_inf["sizeKiB"] = file_info["sizeKB"]
-        model_inf["SHA256"] = file_info["hashes"]["SHA256"]
+        model_inf["sha256"] = file_info["hashes"]["SHA256"]
         model_inf["file_url"] = file_info["downloadUrl"]
 
         local_dir = os.path.join(MODEL_DL_ROOT, model_inf["ldir"])
@@ -187,7 +232,7 @@ def download_from_civitai(model_inf:dict, do_not_dl:bool):
 
         model_inf["saved_as"] = os.path.join(local_dir, model_inf.get("lfile", model_inf["file"]))
 
-        _update_file_state(model_inf, model_inf["SHA256"])
+        _update_file_state(model_inf, model_inf["sha256"])
         if model_inf.get("result", "") == "info: skip same file":
             return model_inf
 
@@ -195,75 +240,8 @@ def download_from_civitai(model_inf:dict, do_not_dl:bool):
         model_inf["result"] = "success"
         return model_inf
 
-    partial_path = model_inf["saved_as"] + PARTIAL_SUFFIX
-
-    sha256_hash = hashlib.sha256()
-    if os.path.isfile(partial_path):
-        # 中断ファイルがあればハッシュに含める
-        with open(partial_path, "rb") as f:
-            while chunk := f.read(CHUNK_SIZE):
-                sha256_hash.update(chunk)
-
-    session = requests.Session()
-
     logger.info("## civitai: start downloading: %s", model_inf["file"])
-    for retry_count in range(MAX_RETRY):
-        part_len = 0
-        if os.path.isfile(partial_path):
-            part_len = os.path.getsize(partial_path)
-            headers["Range"] = f'bytes={part_len}-'
-            logger.debug("civitai: request resuming: %s", model_inf["file"])
-
-        # ファイル本体のダウンロード
-        with session.get(model_inf["file_url"], headers=headers, stream=True, timeout=30) as response:
-            try:
-                response.raise_for_status()
-                
-                if response.status_code == 206:
-                    logger.debug("civitai: resuming")
-                    mode = 'ab'
-                else:
-                    if part_len > 0:
-                        # サーバーがレジュームを拒否して200を返してきた場合はハッシュをリセットして上書き
-                        logger.debug("civitai: resuming was rejected. restart from zero")
-                        sha256_hash = hashlib.sha256()
-                    mode = 'wb'
-
-                with open(partial_path, mode) as f:
-                    for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
-                        if chunk:
-                            f.write(chunk)            # ファイルに書き込み
-                            sha256_hash.update(chunk) # 同時にハッシュを更新
-
-                orig_hash = model_inf["SHA256"].lower()
-                this_hash = sha256_hash.hexdigest().lower()
-                if orig_hash == this_hash:
-                    shutil.move(partial_path, model_inf["saved_as"])
-                    model_inf["result"] = "success"
-                    return model_inf
-
-                model_inf["result"] = f"error: hash mismatch {orig_hash} != {this_hash}"
-                return model_inf
-                
-            except requests.HTTPError as e:
-                stc = e.response.status_code
-                if stc not in RETRY_STATUS_CODES:
-                    model_inf["result"] = "error: " + traceback.format_exc()
-                    return model_inf
-
-                if retry_count == (MAX_RETRY-1):
-                    model_inf["result"] = "error: retry count reached limit: "  + traceback.format_exc()
-                    return model_inf
-
-                logger.warning("retryable error: will be resumed after 20 sec.\n\n %s: %s", stc, e)
-                time.sleep(20)
-                continue
-
-            except Exception as e:
-                model_inf["result"] = "error: " + traceback.format_exc()
-                return model_inf
-
-    model_inf["result"] = "error: unexpected error"
+    model_inf["result"] = _download_file(model_inf["file_url"], headers, model_inf["saved_as"], model_inf["sha256"])
     return model_inf
 
 
@@ -282,9 +260,9 @@ def check_done(do_not_dl:bool):
                 if not do_not_dl:
                     logger.info("### Finished: %s => %s", ret["file"], ret["saved_as"])
             elif ret["result"].startswith("info:"):
-                logger.info("### %s: %s", ret["file"], ret["result"])
+                logger.info("### %s: %s", ret.get("file", ""), ret["result"])
             else:
-                logger.warning("%s: %s", ret["file"], ret["result"])
+                logger.warning("%s: %s", ret.get("file", ""), ret["result"])
         except Exception as e:
             traceback.print_exc(5)
             logger.error("%s: %s", e.__class__.__name__, e)
