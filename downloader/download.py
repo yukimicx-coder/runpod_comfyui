@@ -13,9 +13,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-os.environ["HF_HOME"] = "/workspace/.cache/hf"
+# HF_XET_HIGH_PERFORMANCE = 1 causes many promblems, use it at your own risk
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
-os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 from huggingface_hub import HfApi, hf_hub_download
 
@@ -63,6 +62,18 @@ def hf_get_path_info(kwargs):
         file_path = os.path.join(kwargs["subfolder"], file_path)
     return hf_api.get_paths_info(repo_id=kwargs["repo_id"], paths=[file_path])[0]
 
+def _update_file_state(model_inf:dict, remote_hash:str):
+    if os.path.isfile(model_inf["saved_as"]):
+        if compare_hashes(model_inf["saved_as"], remote_hash):
+            model_inf["state"] = "same"
+        else:
+            model_inf["state"] = "different"
+    else:
+        model_inf["state"] = "missing"
+
+    if model_inf["state"] == "same" and not model_inf.get("overwrite", False):
+        model_inf["result"] = "info: skip same file"
+
 def download_from_hf(model_inf:dict, do_not_dl:bool):
     kwargs = {
         "repo_id": model_inf["repo"],
@@ -86,6 +97,7 @@ def download_from_hf(model_inf:dict, do_not_dl:bool):
 
         local_dir = os.path.join(MODEL_DL_ROOT, model_inf["ldir"])
         os.makedirs(local_dir, exist_ok=True)
+        kwargs["local_dir"] = local_dir
 
         if model_inf.get("subdir"):
             kwargs["subfolder"] = model_inf["subdir"]
@@ -99,16 +111,15 @@ def download_from_hf(model_inf:dict, do_not_dl:bool):
             remote_hash = path_info.lfs["sha256"].lower()
         model_inf["sizeKiB"] = path_info.size/1024.0
 
-        if os.path.isfile(model_inf["saved_as"]) and \
-            not model_inf.get("overwrite", False) and \
-            compare_hashes(model_inf["saved_as"], remote_hash):
-            model_inf["result"] = "info: skip same file"
+        _update_file_state(model_inf, remote_hash)
+        if model_inf.get("result", "") == "info: skip same file":
             return model_inf
 
     if do_not_dl:
         model_inf["result"] = "success"
         return model_inf
 
+    kwargs["local_dir_use_symlinks"] = False
 
     logger.info("## hf start downloading: %s", model_inf['file'])
     try:
@@ -128,6 +139,8 @@ def download_from_hf(model_inf:dict, do_not_dl:bool):
 RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 MAX_RETRY=3
 CHUNK_SIZE=100*1024*1024
+PARTIAL_SUFFIX=".partial"
+
 def download_from_civitai(model_inf:dict, do_not_dl:bool):
     headers = {"Authorization": f"Bearer {os.environ.get('CIVITAI_API_TOKEN', '')}"}
 
@@ -174,17 +187,15 @@ def download_from_civitai(model_inf:dict, do_not_dl:bool):
 
         model_inf["saved_as"] = os.path.join(local_dir, model_inf.get("lfile", model_inf["file"]))
 
-        if os.path.isfile(model_inf["saved_as"]) and \
-            not model_inf.get("overwrite", False) and\
-            compare_hashes(model_inf["saved_as"], model_inf["SHA256"]):
-            model_inf["result"] = "info: skip same file"
+        _update_file_state(model_inf, model_inf["SHA256"])
+        if model_inf.get("result", "") == "info: skip same file":
             return model_inf
 
     if do_not_dl:
         model_inf["result"] = "success"
         return model_inf
 
-    partial_path = model_inf["saved_as"] + ".partial"
+    partial_path = model_inf["saved_as"] + PARTIAL_SUFFIX
 
     sha256_hash = hashlib.sha256()
     if os.path.isfile(partial_path):
@@ -307,6 +318,41 @@ def download_files(dl_list:list, do_not_dl:bool):
             time.sleep(3)
             check_done(do_not_dl)
 
+def remove_files(files:list):
+    stat = [0, 0]
+    logger.info("# Removing files...")
+
+    def _remove_one_file(path:str):
+        try:
+            stat[0] += os.path.getsize(path)
+            stat[1] += 1
+            os.remove(path)
+            logger.debug("file removed: %s", path)
+
+        except FileNotFoundError:
+            return
+        except Exception as e:
+            logger.error("[remove_files] %s: %s: %s", path, e.__class__.__name__, e)
+            return
+
+    for entry in files:
+        file_path = entry["saved_as"]
+        if not os.path.isfile(file_path):
+            logger.warning("missing file: %s", file_path)
+            continue
+
+        _remove_one_file(file_path)
+
+        # remove .partial file
+        part_path = file_path + PARTIAL_SUFFIX
+        if not os.path.isfile(part_path):
+            continue
+
+        _remove_one_file(part_path)
+
+    logger.info("## files has been removed: %d files, %.2f KiB (%d GiB)", stat[1], stat[0]/1024.0, stat[0]/(1024.0**3))
+
+
 args = None
 
 def main():
@@ -350,29 +396,42 @@ def main():
         disabled = group.get("disabled", False)
         if args.enable and k in args.enable:
             disabled = False
-        elif args.disable and k in args.disable:
+        if args.disable and k in args.disable:
             disabled = True
-        if disabled:
-            logger.debug("DL Group was disabled: %s", k)
-            continue
-
         files = group.get("files")
         if not files:
             logger.warning("missing or empty files in group: %s", k)
             continue
+
+        if disabled:
+            logger.debug("mark files of disabled group as 'to be removed': %s", k)
+            for f in files:
+                f["to_be_removed"] = True
 
         dl_list += files
 
     logger.info("# Fetching metadata of files first...")
     download_files(dl_list, True)
 
-    dl_list = [entry for entry in dl_list if entry["result"] == "success"]
+    def _format_info(l:list, msg:str):
+        total_size = sum([entry.get("sizeKiB", 0) for entry in l])
+        gb = int(total_size/1024/1024)
+        return f"## {msg}: {len(l)} files; total {total_size:.2f} KiB ({gb} GiB)"
 
-    total_size = sum(entry.get("sizeKiB", 0) for entry in dl_list)
-    logger.info("## Files to be downloaded: %d files; total %.2f KiB (%dGiB)", len(dl_list), total_size, int(total_size/1024/1024))
+    remove_list = [entry for entry in dl_list if (entry.get("to_be_removed", False) and entry.get("state", "missing") != "missing")]
+    logger.info(_format_info(remove_list, "files to be removed"))
+
+    same_list = [entry for entry in dl_list if (not entry.get("to_be_removed", False) and entry.get("state", "missing") == "same")]
+    logger.info(_format_info(same_list, "same files"))
+
+    dl_list = [entry for entry in dl_list if (not entry.get("to_be_removed", False) and entry.get("state", "missing") != "same")]
+    logger.info(_format_info(dl_list, "files to be downloaded"))
 
     if args.dry_run:
         sys.exit(0)
+
+    remove_files(remove_list)
+   
 
     logger.info("# Downloading actual files...")
     download_files(dl_list, False)
