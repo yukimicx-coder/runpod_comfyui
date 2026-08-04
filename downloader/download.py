@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 import httpx
 import yaml
 from dotenv import load_dotenv
+from tqdm import tqdm
 
 load_dotenv()
 
@@ -75,7 +76,7 @@ def _update_file_state(model_inf:dict, remote_hash:str):
     if model_inf["state"] == "same" and not model_inf.get("overwrite", False):
         model_inf["result"] = "info: skip same file"
 
-def _download_file(url: str, headers: dict, saved_as: str, expected_sha256: str | None = None) -> str:
+def _download_file(url: str, headers: dict, saved_as: str, expected_sha256: str | None = None, expected_size_bytes: int | None = None, label: str = "") -> str:
     partial_path = saved_as + PARTIAL_SUFFIX
 
     sha256_hash = hashlib.sha256()
@@ -103,11 +104,15 @@ def _download_file(url: str, headers: dict, saved_as: str, expected_sha256: str 
                             sha256_hash = hashlib.sha256()
                         mode = 'wb'
 
-                    with open(partial_path, mode) as f:
-                        for chunk in response.iter_bytes(chunk_size=CHUNK_SIZE):
-                            if chunk:
-                                f.write(chunk)
-                                sha256_hash.update(chunk)
+                    with open(partial_path, mode) as f, \
+                         tqdm(total=expected_size_bytes, initial=part_len,
+                              unit='iB', unit_scale=True, desc=label,
+                              leave=False) as pbar:
+                            for chunk in response.iter_bytes(chunk_size=CHUNK_SIZE):
+                                if chunk:
+                                    f.write(chunk)
+                                    sha256_hash.update(chunk)
+                                    pbar.update(len(chunk))
 
                     if expected_sha256 and expected_sha256.lower() != sha256_hash.hexdigest().lower():
                         return f"error: hash mismatch {expected_sha256} != {sha256_hash.hexdigest()}"
@@ -176,7 +181,11 @@ def download_from_hf(model_inf:dict, do_not_dl:bool):
         headers["Authorization"] = f"Bearer {hf_token}"
 
     logger.info("## hf start downloading: %s", model_inf['file'])
-    model_inf["result"] = _download_file(model_inf["file_url"], headers, model_inf["saved_as"], model_inf.get("sha256"))
+    model_inf["result"] = _download_file(
+        model_inf["file_url"], headers, model_inf["saved_as"],
+        expected_sha256=model_inf.get("sha256"),
+        expected_size_bytes=int(model_inf["sizeKiB"] * 1024),
+        label=f"hf: {model_inf['file']}")
     return model_inf
 
 RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -241,7 +250,11 @@ def download_from_civitai(model_inf:dict, do_not_dl:bool):
         return model_inf
 
     logger.info("## civitai: start downloading: %s", model_inf["file"])
-    model_inf["result"] = _download_file(model_inf["file_url"], headers, model_inf["saved_as"], model_inf["sha256"])
+    model_inf["result"] = _download_file(
+        model_inf["file_url"], headers, model_inf["saved_as"],
+        expected_sha256=model_inf["sha256"],
+        expected_size_bytes=int(model_inf["sizeKiB"] * 1024),
+        label=f"civitai: {model_inf['file']}")
     return model_inf
 
 
