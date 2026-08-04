@@ -33,6 +33,18 @@ export_env_vars() {
     fi
 }
 
+statup_scripts() {
+    # setup (blocking) scripts
+    for scrpt in ~/setup_*.sh; do
+        bash $scrpt
+    done
+
+    # run (background) scripts
+    for scrpt in ~/run_*.sh; do
+        bash $scrpt &
+        sleep 2
+    done
+}
 
 # ---------------------------------------------------------------------------- #
 #                               Main Program                                   #
@@ -43,22 +55,17 @@ echo "Pod Started"
 setup_ssh
 export_env_vars
 
-echo "Start script(s) finished, Pod is ready to use."
+statup_scripts
 
-if [ -z "$NO_COMFYUI" ]; then
-    ~/comfy/setup_comfyui.sh
-    comfyui_launcher.sh
-fi
+echo "Start script(s) finished, Pod is ready to use."
 
 # end of 'set -e'
 set +e 
 
-if [ -f "/workspace/post_start.sh" ]; then
-    bash "/workspace/post_start.sh"
+if [ -n "$RUN_NETDRV_SCRIPT" ]; then
+    if [ -f "/workspace/post_start.sh" ]; then
+        bash "/workspace/post_start.sh" &
+    fi
 fi
 
-if [ -n "$MODEL_DL_AUTO_START" ]; then
-    run_download.sh &
-fi
-
-exec tail -F /root/comfy/ComfyUI/user/comfyui_8188.log
+sleep infinity

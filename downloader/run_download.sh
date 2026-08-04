@@ -1,9 +1,16 @@
 #!/bin/bash
 
-pushd ${UV_PROJECT:-~/comfy}
+if [ -z "$MODEL_DL_AUTOSTART" ] || [ "$MODEL_DL_AUTOSTART" -eq 0 ]; then
+    exit 0
+fi
 
-uv pip install huggingface_hub pyyaml requests python-dotenv
+if [ ! -f "${MODEL_DL_LIST:=/workspace/models/dl_list.yaml}" ]; then
+    echo "$MODEL_DL_LIST is missing"
+    exit 1
+fi
 
-uv run download.py $MODEL_DL_ARGS
+uv pip install --system huggingface_hub pyyaml requests python-dotenv
 
-popd
+python ~/download.py $MODEL_DL_ARGS
+
+exit 0

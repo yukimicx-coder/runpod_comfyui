@@ -22,6 +22,10 @@ RUN \
 # Open-SSH
 EXPOSE 22
 RUN mkdir -p /root/.ssh && chmod 0700 /root/.ssh
+COPY ./base/sshd_config /etc/ssh/sshd_config
+RUN chmod 0644 /etc/ssh/sshd_config
+
+ENV TZ=Asia/Tokyo
 
 # PIP/UV
 ARG PIP_BREAK_SYSTEM_PACKAGES=1
@@ -30,6 +34,17 @@ ENV PIP_NO_CACHE_DIR=1
 RUN pip install --no-cache-dir uv
 
 ENV PATH=/root/.local/bin:$PATH
+
+COPY ./base/start.sh /start.sh
+RUN chmod 0755 /start.sh
+
+VOLUME ["/workspace/"]
+
+CMD [ "/start.sh" ]
+
+
+
+FROM base AS comfy_cli
 
 # comfy-cli only
 ENV UV_PROJECT=/root/comfy
@@ -43,37 +58,23 @@ RUN uv venv --no-managed-python --no-python-downloads --seed .venv && \
 ENV COMFY_NO_TELEMETRY=1
 
 EXPOSE 8188
-VOLUME ["/workspace/"]
 
 
-FROM base AS runpod
-
-WORKDIR /
-
-COPY ./base/sshd_config /etc/ssh/sshd_config
-RUN chmod 0644 /etc/ssh/sshd_config
-
-ENV TZ=Asia/Tokyo
+FROM comfy_cli AS comfyui_ready
 
 # スクリプト
 
-COPY ./comfyui/setup_comfyui.sh /root/comfy/setup_comfyui.sh
+COPY ./comfyui/setup_comfyui.sh /root/setup_comfyui.sh
 COPY ./comfyui/comfyui_launcher.sh /root/.local/bin/comfyui_launcher.sh
-RUN chmod 0755 /root/.local/bin/comfyui_launcher.sh /root/comfy/setup_comfyui.sh
+RUN chmod 0755 /root/.local/bin/comfyui_launcher.sh
 
-COPY ./base/start.sh /start.sh
-RUN chmod 0755 /start.sh
-
-COPY ./downloader/run_download.sh /root/.local/bin/run_download.sh
-RUN chmod 0755 /root/.local/bin/run_download.sh
-COPY ./downloader/download.py /root/comfy/download.py
+COPY ./downloader/run_download.sh /root/run_download.sh
+COPY ./downloader/download.py /root/download.py
 
 WORKDIR ${UV_PROJECT}
 
-CMD [ "/start.sh" ]
 
-
-FROM runpod AS runpod_with_comfyui
+FROM comfyui_ready AS comfyui
 
 ARG COMFYCLI_TAG=0.29.2
 ARG COMFYCLI_CUDA=12.8
