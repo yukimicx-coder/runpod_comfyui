@@ -15,6 +15,7 @@ services:
       # Secret
       - PUBLIC_KEY=${PUBLIC_KEY}
       - SSH_KEY_PASSWORD=${SSH_KEY_PASSWORD}
+      - RUNPOD_API_KEY=${RUNPOD_API_KEY}
 
       # for GUI
       - "DISPLAY=:0"

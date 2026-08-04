@@ -12,8 +12,9 @@ services:
       - CIVITAI_API_TOKEN=${CIVITAI_API_TOKEN}
       - CIVITAI_API_URL=${CIVITAI_API_URL:-https://civitai.com/api/v1}
 
-      - NO_COMFYUI=1
-      - NETDRV_SCRIPT=run_download.sh
+      - SKIP_COMFYUI=1
+      - MODEL_DL_AUTOSTART=1
+      - MODEL_DL_ARGS=--dry-run
 
     ports:
       - "127.0.0.1:2422:22"
@@ -29,6 +30,7 @@ services:
       - comfy_net
 
     init: true
+
 
 networks:
   comfy_net:
