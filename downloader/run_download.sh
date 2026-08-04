@@ -9,7 +9,7 @@ if [ ! -f "${MODEL_DL_LIST:=/workspace/models/dl_list.yaml}" ]; then
     exit 1
 fi
 
-uv pip install --system huggingface_hub pyyaml httpx python-dotenv
+uv pip install --system huggingface_hub pyyaml httpx python-dotenv littledl
 
 python ~/download.py $MODEL_DL_ARGS
 

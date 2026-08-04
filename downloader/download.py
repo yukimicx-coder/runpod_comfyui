@@ -2,7 +2,6 @@ import argparse
 import hashlib
 import logging
 import os
-import shutil
 import sys
 import time
 import traceback
@@ -11,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 import httpx
 import yaml
 from dotenv import load_dotenv
+from littledl import DownloadConfig, DownloadError, ProgressEvent, download_file_sync
 from tqdm import tqdm
 
 load_dotenv()
@@ -76,66 +76,80 @@ def _update_file_state(model_inf:dict, remote_hash:str):
     if model_inf["state"] == "same" and not model_inf.get("overwrite", False):
         model_inf["result"] = "info: skip same file"
 
-def _download_file(url: str, headers: dict, saved_as: str, expected_sha256: str | None = None, expected_size_bytes: int | None = None, label: str = "") -> str:
-    partial_path = saved_as + PARTIAL_SUFFIX
+def _download_file(url: str, headers: dict, saved_as: str,
+                   expected_sha256: str | None = None,
+                   expected_size_bytes: int | None = None,
+                   label: str = "",
+                   max_connections: int = 1,
+                   segment_threshold_bytes: int = 0) -> str:
 
-    sha256_hash = hashlib.sha256()
-    if os.path.isfile(partial_path):
-        with open(partial_path, "rb") as f:
-            while chunk := f.read(CHUNK_SIZE):
-                sha256_hash.update(chunk)
+    use_segmented = (max_connections > 1 and expected_size_bytes
+                     and expected_size_bytes >= segment_threshold_bytes)
+
+    config = DownloadConfig(
+        enable_chunking=use_segmented,
+        max_chunks=max_connections,
+        resume=True,
+        verify_hash=expected_sha256 is not None,
+        expected_hash=expected_sha256,
+        fallback_to_single_on_failure=True,
+        headers=headers,
+        timeout=600,
+    )
+
+    save_dir = os.path.dirname(saved_as)
+    filename = os.path.basename(saved_as)
+
+    pbar = tqdm(total=expected_size_bytes, unit='iB', unit_scale=True,
+                desc=label, leave=False, disable=args.no_progress)
+
+    def on_progress(event: ProgressEvent):
+        pbar.n = event.downloaded
+        pbar.refresh()
+
+    try:
+        download_file_sync(url, save_dir, filename, config=config,
+                          progress_callback=on_progress)
+        return "success"
+    except DownloadError:
+        return "error: " + traceback.format_exc()
+    finally:
+        pbar.close()
+
+CHUNK_SIZE=100*1024*1024
+
+def _download_direct(url: str, headers: dict, saved_as: str,
+                     expected_sha256: str | None = None,
+                     expected_size_bytes: int | None = None,
+                     label: str = "") -> str:
+    part_path = saved_as + ".part"
+    hasher = hashlib.sha256()
 
     with httpx.Client(timeout=30, follow_redirects=True) as client:
-        for retry_count in range(MAX_RETRY):
-            req_headers = dict(headers)
-            part_len = 0
-            if os.path.isfile(partial_path):
-                part_len = os.path.getsize(partial_path)
-                req_headers["Range"] = f'bytes={part_len}-'
+        try:
+            with client.stream("GET", url, headers=headers) as response:
+                response.raise_for_status()
 
-            try:
-                with client.stream("GET", url, headers=req_headers) as response:
-                    response.raise_for_status()
+                with open(part_path, "wb") as f, \
+                     tqdm(total=expected_size_bytes, unit='iB', unit_scale=True,
+                          desc=label, leave=False, disable=args.no_progress) as pbar:
+                    for chunk in response.iter_bytes(chunk_size=CHUNK_SIZE):
+                        if chunk:
+                            f.write(chunk)
+                            hasher.update(chunk)
+                            pbar.update(len(chunk))
 
-                    if response.status_code == 206:
-                        mode = 'ab'
-                    else:
-                        if part_len > 0:
-                            sha256_hash = hashlib.sha256()
-                        mode = 'wb'
+                if expected_sha256 and expected_sha256.lower() != hasher.hexdigest().lower():
+                    return f"error: hash mismatch {expected_sha256} != {hasher.hexdigest()}"
 
-                    with open(partial_path, mode) as f, \
-                         tqdm(total=expected_size_bytes, initial=part_len,
-                              unit='iB', unit_scale=True, desc=label,
-                              leave=False) as pbar:
-                            for chunk in response.iter_bytes(chunk_size=CHUNK_SIZE):
-                                if chunk:
-                                    f.write(chunk)
-                                    sha256_hash.update(chunk)
-                                    pbar.update(len(chunk))
+                os.replace(part_path, saved_as)
+                return "success"
 
-                    if expected_sha256 and expected_sha256.lower() != sha256_hash.hexdigest().lower():
-                        return f"error: hash mismatch {expected_sha256} != {sha256_hash.hexdigest()}"
+        except httpx.HTTPStatusError:
+            return "error: " + traceback.format_exc()
+        except Exception:
+            return "error: " + traceback.format_exc()
 
-                    shutil.move(partial_path, saved_as)
-                    return "success"
-
-            except httpx.HTTPStatusError as e:
-                stc = e.response.status_code
-                if stc not in RETRY_STATUS_CODES:
-                    return "error: " + traceback.format_exc()
-
-                if retry_count == (MAX_RETRY - 1):
-                    return "error: retry count reached limit: " + traceback.format_exc()
-
-                logger.warning("retryable error: will be resumed after 20 sec.\n\n %s: %s", stc, e)
-                time.sleep(20)
-                continue
-
-            except Exception:
-                return "error: " + traceback.format_exc()
-
-    return "error: unexpected error"
 
 def download_from_hf(model_inf:dict, do_not_dl:bool):
     if model_inf.get("result"):
@@ -176,6 +190,8 @@ def download_from_hf(model_inf:dict, do_not_dl:bool):
         return model_inf
 
     headers = {}
+    if args.max_segments > 1:
+        headers["Accept-Encoding"] = "identity"
     hf_token = os.environ.get("HF_TOKEN")
     if hf_token:
         headers["Authorization"] = f"Bearer {hf_token}"
@@ -185,13 +201,12 @@ def download_from_hf(model_inf:dict, do_not_dl:bool):
         model_inf["file_url"], headers, model_inf["saved_as"],
         expected_sha256=model_inf.get("sha256"),
         expected_size_bytes=int(model_inf["sizeKiB"] * 1024),
-        label=f"hf: {model_inf['file']}")
+        label=f"hf: {model_inf['file']}",
+        max_connections=args.max_segments,
+        segment_threshold_bytes=args.segment_threshold * (1024**3))
     return model_inf
 
-RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
-MAX_RETRY=3
-CHUNK_SIZE=100*1024*1024
-PARTIAL_SUFFIX=".partial"
+PARTIAL_SUFFIX=".part"
 
 def download_from_civitai(model_inf:dict, do_not_dl:bool):
     headers = {}
@@ -235,6 +250,9 @@ def download_from_civitai(model_inf:dict, do_not_dl:bool):
         model_inf["sizeKiB"] = file_info["sizeKB"]
         model_inf["sha256"] = file_info["hashes"]["SHA256"]
         model_inf["file_url"] = file_info["downloadUrl"]
+        if civitai_token:
+            sep = '&' if '?' in model_inf["file_url"] else '?'
+            model_inf["file_url"] += f"{sep}token={civitai_token}"
 
         local_dir = os.path.join(MODEL_DL_ROOT, model_inf["ldir"])
         os.makedirs(local_dir, exist_ok=True)
@@ -250,7 +268,7 @@ def download_from_civitai(model_inf:dict, do_not_dl:bool):
         return model_inf
 
     logger.info("## civitai: start downloading: %s", model_inf["file"])
-    model_inf["result"] = _download_file(
+    model_inf["result"] = _download_direct(
         model_inf["file_url"], headers, model_inf["saved_as"],
         expected_sha256=model_inf["sha256"],
         expected_size_bytes=int(model_inf["sizeKiB"] * 1024),
@@ -353,7 +371,12 @@ def main():
     parse.add_argument("--disable", type=lambda x: x.split(","))
     parse.add_argument("--list", action="store_true")
     parse.add_argument("--dry-run", action="store_true")
-    parse.add_argument("--max-workers", default=2, type=int)
+    parse.add_argument("--no-progress", action="store_true")
+    parse.add_argument("--max-workers", default=3, type=int)
+    parse.add_argument("--max-segments", default=2, type=int,
+                       help="number of segments for large file (1 = single-stream)")
+    parse.add_argument("--segment-threshold", default=1.5, type=float,
+                       help="min file size (GiB) to use segmented download (0 = disabled)")
     parse.add_argument("--verbose", action="store_true")
 
     args = parse.parse_args()
