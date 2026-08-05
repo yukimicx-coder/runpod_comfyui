@@ -304,9 +304,6 @@ def check_done(do_not_dl:bool):
 def download_files(dl_list:list, do_not_dl:bool):
     with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
         for entry in dl_list:
-            if entry.get("skip", False):
-                continue
-
             check_done(do_not_dl)
             while len(running_dl) >= args.max_workers:
                 time.sleep(5)
@@ -421,6 +418,11 @@ def main():
             logger.debug("mark files of disabled group as 'to be removed': %s", k)
             for f in files:
                 f["to_be_removed"] = True
+        else:
+            for f in files:
+                if f.get("disabled", False):
+                    logger.debug("the entry has 'disabled' flag; mark as 'to be removed")
+                    f["to_be_removed"] = True   
 
         dl_list += files
 
