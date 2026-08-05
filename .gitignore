@@ -2,3 +2,4 @@ archive/
 .env
 test/client/ssh/
 
+workspace_for_sync/
