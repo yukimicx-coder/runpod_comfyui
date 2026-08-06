@@ -15,9 +15,6 @@ from tqdm import tqdm
 
 load_dotenv()
 
-# HF_XET_HIGH_PERFORMANCE = 1 causes many promblems, use it at your own risk
-os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
-os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 from huggingface_hub import HfApi
 
 #
@@ -28,10 +25,13 @@ from huggingface_hub import HfApi
 # CIVITAI_API_TOKEN, CIVITAI_API_URL
 #
 
-MODEL_DL_ROOT=os.environ.get("MODEL_DL_ROOT", "/workspace/models")
-MODEL_DL_LOG=os.environ.get("MODEL_DL_LOG", "/workspace/models/dl.log")
-MODEL_DL_LIST=os.environ.get("MODEL_DL_LIST", "/workspace/models/dl_list.yaml")
+DL_ROOT=os.environ.get("MODEL_DL_ROOT", "/workspace")
+MODEL_DL_LOG=os.environ.get("MODEL_DL_LOG", os.path.join(DL_ROOT, "dl.log"))
+MODEL_DL_LIST=os.environ.get("MODEL_DL_LIST", os.path.join(DL_ROOT, "dl_list.yaml"))
+
 CIVITAI_API_URL = os.environ.get("CIVITAI_API_URL", "https://civitai.com/api/v1")
+
+DEFAULT_BASE_DIR="models"
 
 # logger
 
@@ -116,8 +116,6 @@ def _download_file(url: str, headers: dict, saved_as: str,
     finally:
         pbar.close()
 
-CHUNK_SIZE=100*1024*1024
-
 def _download_direct(url: str, headers: dict, saved_as: str,
                      expected_sha256: str | None = None,
                      expected_size_bytes: int | None = None,
@@ -163,7 +161,7 @@ def download_from_hf(model_inf:dict, do_not_dl:bool):
                 logger.warning("conflict 'subdir' and dirname of 'file': %s != %s", model_inf["subdir"], sub_dir)
             model_inf["subdir"] = sub_dir
 
-        local_dir = os.path.join(MODEL_DL_ROOT, model_inf["ldir"])
+        local_dir = os.path.join(DL_ROOT, model_inf["base_dir"], model_inf.get("ldir", "."))
         os.makedirs(local_dir, exist_ok=True)
 
         model_inf["saved_as"] = os.path.join(local_dir, model_inf.get("lfile", model_inf["file"]))
@@ -254,7 +252,7 @@ def download_from_civitai(model_inf:dict, do_not_dl:bool):
             sep = '&' if '?' in model_inf["file_url"] else '?'
             model_inf["file_url"] += f"{sep}token={civitai_token}"
 
-        local_dir = os.path.join(MODEL_DL_ROOT, model_inf["ldir"])
+        local_dir = os.path.join(DL_ROOT, model_inf["base_dir"], model_inf.get("ldir", "."))
         os.makedirs(local_dir, exist_ok=True)
 
         model_inf["saved_as"] = os.path.join(local_dir, model_inf.get("lfile", model_inf["file"]))
@@ -275,54 +273,114 @@ def download_from_civitai(model_inf:dict, do_not_dl:bool):
         label=f"civitai: {model_inf['file']}")
     return model_inf
 
+def download_from_url(model_inf:dict, do_not_dl:bool):
+    if not do_not_dl:
+        model_inf["result"] = _download_direct(
+            model_inf["file_url"], None, model_inf["saved_as"]
+        )
+        return model_inf
+
+    missing = []
+    if not model_inf.get("url"):
+        missing.append('url')
+    if not model_inf.get("lfile"):
+        missing.append("lfile")
+    if missing:
+        msg = f"missing key(s): {missing}"
+        model_inf["result"] = f"error: {msg}"
+        logger.warning("%s: %s", msg, model_inf)
+        return model_inf
+
+    model_inf["file"] = model_inf["lfile"]
+
+    try:
+        parsed = httpx.URL(model_inf["url"])
+        if not parsed.scheme or not parsed.host:
+            raise ValueError()
+    except:
+        msg = f"invalid url: {model_inf['url']}"
+        logger.warning(msg)
+        model_inf["result"] = "error: " + msg
+        return model_inf
+
+    model_inf["file_url"] = model_inf["url"]
+
+    local_path = os.path.abspath(os.path.join(DL_ROOT, model_inf["base_dir"], model_inf.get("ldir", "."), model_inf["lfile"]))
+    if not local_path.startswith(DL_ROOT):
+        msg = f"invalid local path: {local_path}"
+        logger.error(msg)
+        model_inf["result"] = "error :" + msg
+        return model_inf
+
+    model_inf["saved_as"] = local_path
+    return model_inf
 
 
-running_dl = []
 
-def check_done(do_not_dl:bool):
-    finished = []
-    for f in running_dl:
-        if not f.done():
-            continue
-        finished.append(f)
-        try:
-            ret = f.result()
-            if ret["result"] == "success":
-                if not do_not_dl:
-                    logger.info("### Finished: %s => %s", ret["file"], ret["saved_as"])
-            elif ret["result"].startswith("info:"):
-                logger.info("### %s: %s", ret.get("file", ""), ret["result"])
-            else:
-                logger.warning("%s: %s", ret.get("file", ""), ret["result"])
-        except Exception as e:
-            traceback.print_exc(5)
-            logger.error("%s: %s", e.__class__.__name__, e)
-
-    for f in finished:
-        running_dl.remove(f)
-
+MAX_WORKERS=3
 def download_files(dl_list:list, do_not_dl:bool):
-    with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
-        for entry in dl_list:
-            check_done(do_not_dl)
-            while len(running_dl) >= args.max_workers:
-                time.sleep(5)
-                check_done(do_not_dl)
+    dl_queue = {
+        "hf": [],
+        "civitai": [],
+        "url": []
+    }
 
-            match entry["type"]:
-                case "hf":
-                    future = executor.submit(download_from_hf, entry, do_not_dl)
-                case "civitai":
-                    future = executor.submit(download_from_civitai, entry, do_not_dl)
-                case _:
-                    logger.warning("unknown type: %s", entry["type"])
-                    continue
+    for entry in dl_list:
+        if not do_not_dl:
+            missing = []
+            if not entry.get("saved_as"):
+                missing.append('saved_as')
+            if not entry.get("file_url"):
+                missing.append("file_url")
+            if missing:
+                msg = f"missing key(s): {missing}"
+                entry["result"] = f"error: {msg}"
+                logger.warning("%s: %s", msg, entry)
+                continue
 
-            running_dl.append(future)
+        match entry["type"]:
+            case "hf":
+                dl_queue["hf"].append(entry)
+            case "civitai":
+                dl_queue["civitai"].append(entry)
+            case _:
+                dl_queue["url"].append(entry)
+
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        def _download_loop(which):
+            for entry in dl_queue[which]:
+                try:
+                    match which:
+                        case "hf":
+                            download_from_hf(entry, do_not_dl)
+                        case "civitai":
+                            download_from_civitai(entry, do_not_dl)
+                        case _:
+                            download_from_url(entry, do_not_dl)
+                except Exception as e:
+                    logger.error("%s: %s\n\n%s", e.__class__.__name__, e, traceback.format_exc(e))
+                    return
+                if entry["result"] == "success":
+                    if not do_not_dl:
+                        logger.info("### Finished: %s => %s", entry["file"], entry["saved_as"])
+                elif entry["result"].startswith("info:"):
+                    logger.info("### %s: %s", entry.get("file", ""), entry["result"])
+                else:
+                    logger.warning("%s: %s", entry.get("file", ""), entry["result"])
+
+        running_dl = []
+        future = executor.submit(_download_loop, "hf")
+        running_dl.append(future)
+        future = executor.submit(_download_loop, "civitai")
+        running_dl.append(future)
+        future = executor.submit(_download_loop, "url")
+        running_dl.append(future)
 
         while len(running_dl) > 0:
             time.sleep(3)
-            check_done(do_not_dl)
+            running_dl = [f for f in running_dl if not f.done()]
+            print(running_dl)
 
 def remove_files(files:list):
     stat = [0, 0]
@@ -359,17 +417,18 @@ def remove_files(files:list):
     logger.info("## files has been removed: %d files, %.2f KiB (%d GiB)", stat[1], stat[0]/1024.0, stat[0]/(1024.0**3))
 
 
+CHUNK_SIZE=0
 args = None
 
 def main():
-    global args, pbar
+    global args, CHUNK_SIZE
     parse = argparse.ArgumentParser("model downloader")
     parse.add_argument("--enable", type=lambda x: x.split(","))
     parse.add_argument("--disable", type=lambda x: x.split(","))
     parse.add_argument("--list", action="store_true")
     parse.add_argument("--dry-run", action="store_true")
     parse.add_argument("--no-progress", action="store_true")
-    parse.add_argument("--max-workers", default=3, type=int)
+    parse.add_argument("--chunk-size", default=64, help="chunk size (MiB)", type=float)
     parse.add_argument("--max-segments", default=2, type=int,
                        help="number of segments for large file (1 = single-stream)")
     parse.add_argument("--segment-threshold", default=1.5, type=float,
@@ -378,6 +437,7 @@ def main():
 
     args = parse.parse_args()
 
+    CHUNK_SIZE = args.chunk_size * (1024**2)
     if args.verbose:
         logger.setLevel(logging.DEBUG)
 
@@ -402,6 +462,7 @@ def main():
                 
 
     dl_list = []
+    # apply group settings
     for k in yml:
         group = yml[k]
         disabled = group.get("disabled", False)
@@ -409,20 +470,21 @@ def main():
             disabled = False
         if args.disable and k in args.disable:
             disabled = True
+
         files = group.get("files")
         if not files:
             logger.warning("missing or empty files in group: %s", k)
             continue
 
-        if disabled:
-            logger.debug("mark files of disabled group as 'to be removed': %s", k)
-            for f in files:
-                f["to_be_removed"] = True
-        else:
-            for f in files:
-                if f.get("disabled", False):
-                    logger.debug("the entry has 'disabled' flag; mark as 'to be removed")
-                    f["to_be_removed"] = True   
+        base_dir = group.get("base_dir", DEFAULT_BASE_DIR)
+        if ".." in base_dir:
+            logger.warning("'base_dir' cannot have '..'; skip group %s", k)
+            continue
+
+        for file in files:
+            if disabled or file.get("disabled", False):
+                file["to_be_removed"] = True
+            file["base_dir"] = base_dir
 
         dl_list += files
 
