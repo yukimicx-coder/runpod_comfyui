@@ -56,7 +56,7 @@ services:
 
     init: true
 
-    command: "sleep infinity"
+    #command: "sleep infinity"
 
 networks:
   comfy_net:

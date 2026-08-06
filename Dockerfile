@@ -69,9 +69,6 @@ COPY ./comfyui/setup_comfyui.sh /root/setup_comfyui.sh
 COPY ./comfyui/comfyui_launcher.sh /root/.local/bin/comfyui_launcher.sh
 RUN chmod 0755 /root/.local/bin/comfyui_launcher.sh
 
-COPY ./downloader/run_download.sh /root/run_download.sh
-COPY ./downloader/download.py /root/download.py
-
 WORKDIR ${UV_PROJECT}
 
 

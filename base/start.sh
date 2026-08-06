@@ -62,10 +62,10 @@ echo "Start script(s) finished, Pod is ready to use."
 # end of 'set -e'
 set +e 
 
-if [ -n "$RUN_NETDRV_SCRIPT" ]; then
-    if [ -f "/workspace/post_start.sh" ]; then
-        bash "/workspace/post_start.sh" &
-    fi
+if [ -f "/workspace/post_start.sh" ]; then
+    cd /workspace
+    echo "detect post_start.sh: run it..."
+    bash "/workspace/post_start.sh" &
 fi
 
 sleep infinity
