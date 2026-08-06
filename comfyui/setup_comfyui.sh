@@ -7,39 +7,20 @@ fi
 _COMFYUI_ROOT=ComfyUI
 _MOUNT_ROOT=/workspace
 
-put_extra_model_paths() {
-    cat <<EOL > $_COMFYUI_ROOT/extra_model_paths.yaml
-workspace_models:
-    base_path: $_MOUNT_ROOT/models/
-    checkpoints: checkpoints/
-    clip_vision: clip_vision/
-    controlnet: controlnet/
-    diffusion_models: diffusion_models/
-    embeddings: embeddings/
-    ipadapter: ipadapter/
-    loras: loras/
-    model_patches: model_patches/
-    text_encoders: text_encoders/
-    vae: vae/
-EOL
-}
-
 replace_subdir_to_symlink() {
 
     replace_dir_to_link() {
         [ ! -d "$_MOUNT_ROOT/$1" ] && return 0
         if [ -d "$_COMFY_ROOT/$1" ]; then
             rm -rf "$_COMFY_ROOT/$1"
-            ln -sf "$_MOUNT_ROOT/$1" "$_COMFY_ROOT/$1"
         fi
+        ln -sf "$_MOUNT_ROOT/$1" "$_COMFY_ROOT/$1"
         return 0
     }
 
-    if [ "$need_symlink_subdirs" -ne 0 ]; then
-        for dir in custom_nodes models output input user; do
-            replace_dir_to_link $dir
-        done
-    fi
+    for dir in custom_nodes output input user/default models/checkpoints models/diffusion_models models/loras; do
+        replace_dir_to_link $dir
+    done
 }
 
 install_comfyui() {
@@ -70,7 +51,8 @@ prepare_comfyui() {
 
             if [ ! -f $_COMFYUI_ROOT/main.py ] || [ ! -d $_COMFYUI_ROOT/custom_nodes ]; then
                 echo "Failed to extract ComfyUI"
-                return 2
+                echo "fall back normal install..."
+                install_comfyui
             fi
             replace_subdir_to_symlink
         else
@@ -78,15 +60,12 @@ prepare_comfyui() {
             replace_subdir_to_symlink
         fi
     fi
-    echo "update dependencies..."
     install_comfyui
 }
 
 pushd ~/comfy
 
 prepare_comfyui
-
-put_extra_model_paths 
 
 popd
 
