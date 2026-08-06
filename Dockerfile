@@ -13,6 +13,7 @@ RUN \
     init-system-helpers \
     openssh-server \
     procps \
+    aria2 \
     git \
     ca-certificates \
     ffmpeg \
