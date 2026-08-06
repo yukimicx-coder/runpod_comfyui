@@ -11,8 +11,8 @@ _verbose=
 [ -n "$COMFY_VERBOSE" ] && _verbose=--verbose
 _listen=
 [ -n "$COMFY_LISTEN" ] && _listen="--listen $COMFY_LISTEN"
-_port=8188
-[ -n "$COMFY_PORT" ] && _port="$COMFY_PORT"
+_port="--port 8188"
+[ -n "$COMFY_PORT" ] && _port="--port $COMFY_PORT"
 
 while [ -n "$1" ]; do
     case "$1" in
@@ -65,7 +65,7 @@ if [ -n "$opt_stop" ]; then
 fi
 
 
-$COMFY_CLI --recent launch $_bg -- $_cpu $_verbose $_listen --port $_port
+$COMFY_CLI --recent launch $_bg -- $_cpu $_verbose $_listen $_port $COMFY_ARGS
 
 popd
 
