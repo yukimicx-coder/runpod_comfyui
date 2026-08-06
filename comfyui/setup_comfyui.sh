@@ -77,8 +77,9 @@ prepare_comfyui() {
             install_comfyui
             replace_subdir_to_symlink
         fi
-        install_comfyui
     fi
+    echo "update dependencies..."
+    install_comfyui
 }
 
 pushd ~/comfy
