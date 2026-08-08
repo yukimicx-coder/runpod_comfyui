@@ -1,0 +1,5 @@
+workspace_models:
+    base_path: /workspace/models/
+    checkpoints: checkpoints/
+    diffusion_models: diffusion_models/
+    loras: loras/

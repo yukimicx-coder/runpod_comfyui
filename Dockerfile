@@ -13,7 +13,7 @@ RUN \
     init-system-helpers \
     openssh-server \
     procps \
-    aria2 \
+    jq \
     git \
     ca-certificates \
     ffmpeg \
@@ -60,6 +60,7 @@ ENV COMFY_NO_TELEMETRY=1
 
 EXPOSE 8188
 
+COPY ./comfyui/extra_model_paths.yaml /root/comfy/extra_model_paths.yaml
 
 FROM comfy_cli AS comfyui_ready
 
