@@ -13,6 +13,7 @@ RUN \
     init-system-helpers \
     openssh-server \
     procps \
+    curl \
     jq \
     git \
     ca-certificates \
