@@ -7,19 +7,11 @@ fi
 _COMFYUI_ROOT=ComfyUI
 _MOUNT_ROOT=/workspace
 
-replace_subdir_to_symlink() {
-
-    replace_dir_to_link() {
-        [ ! -d "$_MOUNT_ROOT/$1" ] && return 0
-        if [ -d "$_COMFY_ROOT/$1" ]; then
-            rm -rf "$_COMFY_ROOT/$1"
+copy_custom_nodes() {
+    for dir in "$_MOUNT_ROOT/custom_nodes/*" ; do
+        if [ -d "$dir" ]; then
+            cp -R -f $dir "$_COMFYUI_ROOT/custom_nodes/"
         fi
-        ln -sf "$_MOUNT_ROOT/$1" "$_COMFY_ROOT/$1"
-        return 0
-    }
-
-    for dir in custom_nodes output input user/default models/checkpoints models/diffusion_models models/loras; do
-        replace_dir_to_link $dir
     done
 }
 
@@ -54,12 +46,13 @@ prepare_comfyui() {
                 echo "fall back normal install..."
                 install_comfyui
             fi
-            replace_subdir_to_symlink
+            copy_custom_nodes
         else
             install_comfyui
-            replace_subdir_to_symlink
+            copy_custom_nodes
         fi
     fi
+    # update dependencies
     install_comfyui
 }
 
