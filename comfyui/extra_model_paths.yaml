@@ -3,3 +3,5 @@ workspace_models:
     checkpoints: checkpoints/
     diffusion_models: diffusion_models/
     loras: loras/
+    latent_upscale_models: latent_upscale_models/
+    vae: vae/
