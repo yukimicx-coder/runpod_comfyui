@@ -69,5 +69,5 @@ prepare_comfyui
 
 popd
 
-comfyui_launcher.sh restart
+comfyui_launcher.sh
 
