@@ -69,7 +69,7 @@ if [ -n "$opt_stop" ]; then
     exit 0
 fi
 
-env_json=$($COMFY_CLI launch $_bg -- $_cpu $_verbose $_emp_yaml $_listen $_port $COMFY_ARGS)
+env_json=$($COMFY_CLI launch $_bg -- --preview-method none $_cpu $_verbose $_emp_yaml $_listen $_port $COMFY_ARGS)
 if [ "$(echo $env_json | jq -r .error)" != "null" ]; then
     echo $env_json
     exit 1
