@@ -36,13 +36,17 @@ export_env_vars() {
 statup_scripts() {
     # setup (blocking) scripts
     for scrpt in ~/setup_*.sh; do
-        bash $scrpt
+        if [ -f $scrpt ]; then
+            bash $scrpt
+        fi
     done
 
     # run (background) scripts
     for scrpt in ~/run_*.sh; do
-        bash $scrpt &
-        sleep 2
+        if [ -f $scrpt ]; then
+            bash $scrpt &
+            sleep 2
+        fi
     done
 }
 
