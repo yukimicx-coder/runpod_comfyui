@@ -2,26 +2,39 @@
 
 setlocal
 
-set COMFYCLI_TAG=0.29.2
-set COMFYCLI_CUDA=12.8
+if "%2" == "" goto HELP
 
-set COMFYUI_TAR_ROOT=U:\Docker\RunPod\archive
+goto INIT
 
-set WORKSPACE=u:\workspace
+:HELP
+echo "usage: test_runpod.bat <workspace> <compose_dir> [use_gpu]"
+
+
+exit /b 1
+
+:INIT
+if not defined COMFYCLI_TAG set COMFYCLI_TAG=0.33.1
+if not defined COMFYCLI_CUDA set COMFYCLI_CUDA=13.0
+
+set WORKSPACE=%1
 
 set compose_files=-f docker-compose.yaml
 
-set work_dir=%~dp0client
-if "%1" == "server" (
-    set work_dir=%~dp0server
+set compose_dir=%~dp0%2
+if not exist %compose_dir% (
+    echo %compose_dir% is not found
+    exit /b 1
 )
 
-if "%1" == "downloader" (
-    set work_dir=%~dp0downloader
-) else (
-    if "%USERDOMAIN%" == "KUROSUKE" set compose_files=%compose_files% -f GPU-compose.yaml
+pushd %compose_dir%
+
+if "%3" == "use_gpu" (
+    if exist GPU-compose.yaml set  compose_files=%compose_files% -f GPU-compose.yaml
 )
 
-pushd %work_dir%
 docker compose %compose_files% up -d
+
+popd
+
+goto :EOF
 
