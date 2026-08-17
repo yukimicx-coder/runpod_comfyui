@@ -15,6 +15,7 @@
 - 全体ファイルを `bytes` や `bytearray` に読み込まない。
 - `seek` と `write` は同一ファイル用の `asyncio.Lock` の中で実行する。
 - 全体SHA256は、全書き込み完了後に出力ファイルを読み直して計算する。
+- アプリケーション独自の総バッファ上限は設けない。バッファ管理はhttpxに任せる。
 
 ## 3. 推奨ファイル構成
 
@@ -90,7 +91,8 @@ APIと実データ取得で同じクライアントを使用する。タスク�
 
 ダウンロード前にフェーズ1として全対象のメタデータを解決する。
 解決結果はエントリへ正規化して保存し、後続の既存ファイル判定とダウンロードで同じ値を使う。
-`--dry-run` でもこのフェーズを実行し、解決失敗があれば終了コード1にする。
+1件でも解決に失敗した場合は、通常実行・`--dry-run`ともフェーズ2へ進まず全体を中止する。
+`--dry-run` の終了コードは1とする。
 
 #### range
 
@@ -173,6 +175,9 @@ async def download_segment(
 
 `Accept-Encoding: identity` をsplit/rangeのGETとHEADに指定し、圧縮転送によるサイズ解釈の差を避ける。
 
+同時実行数は `asyncio.Semaphore` と `httpx.Limits(max_connections=...)` で制限する。
+`--buffer-limit` は使用しない。`httpx.AsyncClient` のストリーミングと接続プールにバッファ管理を委ねる。
+
 #### Google Drive resolver
 
 gdownをDownloaderから直接呼び出してはならない。gdownの同期APIはイベントループをブロックし、内部の `.part` 一時ファイルは本設計の制約に反する。
@@ -251,13 +256,13 @@ HTTPサーバーが `200` を返した場合は失敗させる。
 --list
 --dry-run
 --chunk-size SIZE
---buffer-limit SIZE
 --max-concurrent N
 --no-progress
 --verbose
 ```
 
-`--max-concurrent` は指定時のみ上限を下げる用途にし、バッファ計算による上限を超えないようにする。
+`--max-concurrent` は同時ダウンロード接続数の上限として使用する。
+httpxの `Limits(max_connections=...)` と同じ上限を設定し、バッファ量の計算には使用しない。
 
 ## 5. ログと結果
 
@@ -285,7 +290,7 @@ HTTPサーバーが `200` を返した場合は失敗させる。
 4. rangeで最後のチャンクだけ短いケース
 5. 200応答を返すRange非対応サーバーの失敗
 6. 途中切断後のリトライが対象範囲を先頭から上書きすること
-7. サイズ超過・サイズ不足の失敗
+7. サイズ超過・サイズ不足の失敗（決定的エラーとしてリトライしないこと）
 8. category未指定時に何もダウンロードしないホワイトリスト動作
 9. disabledカテゴリ、disabledエントリ、category絞り込み
 10. 既存ファイルのSHA256一致スキップ
@@ -298,12 +303,15 @@ HTTPサーバーが `200` を返した場合は失敗させる。
 17. CivitAIのfileIdで正しいファイルが選択されること
 18. Google Drive確認HTMLから最終URLを解決できること
 19. Google DriveのCookieとhidden inputを保持できること
-20. Google DriveのRange方式を拒否すること
-21. Google Drive接続切断後のRange再開または先頭再取得
-22. `threading` や `concurrent.futures` がimportされていないこと
+20. SHA256なしのGoogle Drive splitで強いwarningと `unverified` が記録されること
+21. Google DriveのRange方式を拒否すること
+22. Google Drive接続切断後のRange再開または先頭再取得
+23. フェーズ1のメタデータ失敗時にフェーズ2へ進まず全体中止すること
+24. `threading` や `concurrent.futures` がimportされていないこと
 
 `--list` は実データへアクセスせずにカテゴリと無効項目を表示する。
 `--dry-run` は実データ本体をダウンロードしないが、フェーズ1のメタデータ取得（API/HEAD/Google Drive resolver）と既存ファイル状態確認は実行する。
+フェーズ1に1件でも失敗した場合は全体を中止し、終了コード1とする。
 
 ## 7. run_download.sh
 
