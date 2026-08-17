@@ -861,8 +861,15 @@ async def download_segment(
     """
     async with semaphore:
         last_error: Exception | None = None
+        # Bytes of this part already durably written to disk. Persists across
+        # attempts so a TransportError mid-transfer resumes from this offset
+        # instead of re-fetching the whole part.
+        written = 0
+        # Cache the GDrive-resolved URL so retries don't re-run the
+        # confirmation-page resolver (avoids an extra GET and HTML re-appearance).
+        resolved_url: str | None = None
+
         for attempt in range(retries):
-            received = 0
             try:
                 headers: dict[str, str] = {}
                 if extra_headers:
@@ -872,16 +879,41 @@ async def download_segment(
                 # Auth via header (never put tokens in the URL)
                 headers.update(_auth_headers(url))
 
-                # Google Drive: resolve the confirmation page first
+                # Google Drive: resolve the confirmation page first (cached)
                 request_url = url
                 gdrive = is_google_drive_url(url)
                 if gdrive:
-                    request_url = await resolve_google_drive_url(client, url)
+                    if resolved_url is None:
+                        resolved_url = await resolve_google_drive_url(client, url)
+                        logger.info(
+                            "segment[%s] gdrive resolved %s -> %s",
+                            label, sanitize_url(url), sanitize_url(resolved_url),
+                        )
+                    request_url = resolved_url
                     headers.setdefault("User-Agent", _GOOGLE_DRIVE_UA)
-                    logger.info(
-                        "segment[%s] gdrive resolved %s -> %s",
-                        label, sanitize_url(url), sanitize_url(request_url),
-                    )
+
+                resume = written
+                # remaining bytes still needed for this part
+                remaining = expected_size - resume if expected_size is not None else None
+
+                # Build the Range header for the remainder of this part.
+                if resume > 0:
+                    if "Range" in headers:
+                        # range type: extra_headers already requested the whole
+                        # chunk [offset, offset+expected_size-1]; narrow it to
+                        # the not-yet-written suffix.
+                        crange = headers["Range"]
+                        m = re.match(r"bytes=(\d+)-(\d+)", crange)
+                        if m:
+                            chunk_end = int(m.group(2))
+                            headers["Range"] = (
+                                f"bytes={offset + resume}-{chunk_end}"
+                            )
+                    else:
+                        # split type: request the remainder of the remote part.
+                        headers["Range"] = f"bytes={resume}-"
+
+                resume_active = resume > 0
 
                 async with client.stream("GET", request_url, headers=headers) as resp:
                     resp.raise_for_status()
@@ -897,32 +929,45 @@ async def download_segment(
 
                     # Validate range response (deterministic: no retry)
                     if "Range" in headers:
-                        if resp.status_code != 206:
+                        if resume_active and resp.status_code == 200:
+                            # Server ignored our Range: the 200 body is the
+                            # whole part. Fall back to a full re-fetch from the
+                            # start of the part by overwriting what we had.
+                            logger.warning(
+                                "segment[%s] server ignored Range for resume; "
+                                "re-fetching part from start (%s)",
+                                label, sanitize_url(url),
+                            )
+                            written = 0
+                            resume_active = False
+                            remaining = expected_size
+                        elif resp.status_code != 206:
                             raise SegmentSizeError(
                                 f"Expected 206 for Range request, got {resp.status_code}"
                             )
-                        cr = resp.headers.get("content-range", "")
-                        cr_match = re.match(r"bytes (\d+)-(\d+)/(\d+)", cr)
-                        if not cr_match:
-                            raise SegmentSizeError(
-                                f"Missing or invalid Content-Range: {cr!r}"
-                            )
-                        cr_start = int(cr_match.group(1))
-                        cr_end = int(cr_match.group(2))
-                        cr_total = int(cr_match.group(3))
-                        if cr_start != offset:
-                            raise SegmentSizeError(
-                                f"Content-Range start mismatch: expected {offset}, got {cr_start}"
-                            )
-                        expected_chunk = cr_end - cr_start + 1
-                        if expected_size is not None and expected_chunk != expected_size:
-                            raise SegmentSizeError(
-                                f"Content-Range chunk size mismatch: expected {expected_size}, got {expected_chunk}"
-                            )
-                        if expected_total is not None and cr_total != expected_total:
-                            raise SegmentSizeError(
-                                f"Content-Range total mismatch: expected {expected_total}, got {cr_total}"
-                            )
+                        else:
+                            cr = resp.headers.get("content-range", "")
+                            cr_match = re.match(r"bytes (\d+)-(\d+)/(\d+)", cr)
+                            if not cr_match:
+                                raise SegmentSizeError(
+                                    f"Missing or invalid Content-Range: {cr!r}"
+                                )
+                            cr_start = int(cr_match.group(1))
+                            cr_end = int(cr_match.group(2))
+                            cr_total = int(cr_match.group(3))
+                            if cr_start != offset + written:
+                                raise SegmentSizeError(
+                                    f"Content-Range start mismatch: expected {offset + written}, got {cr_start}"
+                                )
+                            expected_chunk = cr_end - cr_start + 1
+                            if remaining is not None and expected_chunk != remaining:
+                                raise SegmentSizeError(
+                                    f"Content-Range chunk size mismatch: expected {remaining}, got {expected_chunk}"
+                                )
+                            if expected_total is not None and cr_total != expected_total:
+                                raise SegmentSizeError(
+                                    f"Content-Range total mismatch: expected {expected_total}, got {cr_total}"
+                                )
 
                     # Content-Length hint for early detection (diagnostic + guard)
                     content_length: int | None = None
@@ -942,29 +987,28 @@ async def download_segment(
                         )
 
                     # Stream to file with seek
-                    received = 0
                     with open(output_path, "r+b") as f:
                         # NOTE: aiter_bytes() with no chunk_size returns each
                         # network chunk as it arrives, so we can stop promptly
-                        # when expected_size is reached. Passing a large
+                        # when the expected size is reached. Passing a large
                         # chunk_size would make httpx buffer up to that many
                         # bytes before yielding, delaying the stop.
                         async for chunk in resp.aiter_bytes():
                             if not chunk:
                                 continue
                             chunk_len = len(chunk)
-                            if expected_size is not None and received + chunk_len > expected_size:
+                            if expected_size is not None and written + chunk_len > expected_size:
                                 raise SegmentSizeError(
-                                    f"oversize: received {received + chunk_len} "
+                                    f"oversize: received {written + chunk_len} "
                                     f"bytes, expected {expected_size} max"
                                 )
                             async with write_lock:
-                                f.seek(offset + received)
+                                f.seek(offset + written)
                                 f.write(chunk)
-                            received += chunk_len
+                            written += chunk_len
                             if progress:
                                 progress.update(chunk_len)
-                            if expected_size is not None and received == expected_size:
+                            if expected_size is not None and written == expected_size:
                                 if (
                                     content_length is not None
                                     and content_length > expected_size
@@ -980,34 +1024,34 @@ async def download_segment(
                                 )
                                 break
 
-                    if expected_size is not None and received != expected_size:
+                    if expected_size is not None and written != expected_size:
                         raise SegmentSizeError(
-                            f"incomplete: got {received} bytes, expected {expected_size}"
+                            f"incomplete: got {written} bytes, expected {expected_size}"
                         )
 
-                    return received  # success
+                    return written  # success
 
             except SegmentSizeError as e:
                 logger.error(
                     "segment[%s] size error (attempt %d/%d, offset=%d, expected=%s, "
-                    "received=%d) %s: %s",
+                    "written=%d) %s: %s",
                     label, attempt + 1, retries, offset, expected_size,
-                    received, sanitize_url(url), e,
+                    written, sanitize_url(url), e,
                 )
                 raise  # deterministic error: do not retry
             except (httpx.HTTPStatusError, httpx.TransportError, ValueError) as e:
                 last_error = e
                 logger.warning(
                     "segment[%s] download error (attempt %d/%d, offset=%d, "
-                    "expected=%s, received=%d) %s: %s",
+                    "expected=%s, written=%d) %s: %s",
                     label, attempt + 1, retries, offset, expected_size,
-                    received, sanitize_url(url), e,
+                    written, sanitize_url(url), e,
                 )
                 if attempt < retries - 1:
                     wait = RETRY_BACKOFF ** (attempt + 1)
                     logger.info(
-                        "segment[%s] retry in %ds (attempt %d/%d): %s",
-                        label, wait, attempt + 1, retries, sanitize_url(url),
+                        "segment[%s] retry in %ds (attempt %d/%d, resuming from +%d): %s",
+                        label, wait, attempt + 1, retries, written, sanitize_url(url),
                     )
                     await asyncio.sleep(wait)
 
