@@ -3,7 +3,9 @@
 ## 1. 目的
 
 `dl_model_list.yaml` を読み込み、大容量ファイルをストリーミングで取得する。
-ダウンロード対象はトップレベルキーで絞り込みでき、ファイルは YAML の `disabled` により無効化できる。
+ダウンロード対象は `--category` で明示的に指定されたトップレベルキーだけとする。
+カテゴリ未指定時は全カテゴリを対象にせず、何もダウンロードしない。
+ファイルは YAML の `disabled` により無効化できる。
 
 実装上の必須条件は次のとおり。
 
@@ -29,6 +31,14 @@ HTTPの各チャンクを小さく受信し、書き込み区間だけ同期I/O�
 ### 2.2 出力ファイルへ直接書き込む
 
 パーツごとの一時ファイルは作成しない。出力先を最終パスとして作成し、`truncate(total_size)` で必要サイズを確保した後、各タスクが `seek(offset)` して書き込む。
+
+出力パスは次の形式とする。
+
+```text
+MODELS_ROOT/<dir>/<category>/<file>
+```
+
+`MODELS_ROOT` は `MODEL_DL_ROOT/models` とする。
 
 不完全ファイルを完成品と誤認しないため、次のロックファイルを使用する。
 
@@ -90,23 +100,25 @@ category-name:
 9_433_061_528
 ```
 
-### 3.2 フィールドの優先順位
+### 3.2 フィールドの優先順位と齟齬の扱い
 
 `range` の総サイズ:
 
-1. YAML の `filesize`
-2. HF/CivitAI APIから取得したサイズ
-3. 対象URLの `HEAD` の `Content-Length`
+1. HF/CivitAI APIから取得したサイズ
+2. 対象URLの `HEAD` の `Content-Length`
+3. YAML の `filesize`
 4. 取得不能ならエラー
 
 `split` のパーツサイズ:
 
-1. YAML の `part-sizes`
-2. 各URLの `HEAD` の `Content-Length`
+1. 各URLの `HEAD` の `Content-Length`
+2. YAML の `part-sizes`
 3. 取得不能ならエラー
 
-YAML指定値がある場合も、実際の受信バイト数は必ず検証する。
-APIやHEADで別のサイズが取得できた場合、YAML値と一致しなければダウンロード前にエラーとする。
+YAMLの `filesize` と `part-sizes` は参考値であり、サーバーから取得した値を優先する。
+サーバー値とYAML値が異なる場合はwarningを出してサーバー値で続行する。
+サーバー値が複数URL間で異なる場合は、同一ファイルを構成できないためエラーとする。
+実際の受信バイト数は、解決したサーバー値またはYAML fallback値と必ず一致させる。
 
 ## 4. rangeの仕様
 
@@ -167,12 +179,24 @@ version IDだけでファイルを選択してはならない。複数ファイ�
 
 検証をスキップした場合もダウンロード成功にはできるが、結果ログに `unverified` を明示する。
 
+### 6.4 メタデータ解決フェーズ
+
+ダウンロード前に全対象のメタデータを取得するフェーズ1を実行する。
+
+- `range`: サイズとSHA256を解決する
+- `split`: 各パーツサイズを解決し、合計サイズを計算する
+- YAML値はサーバー情報が取得できない場合のfallbackとして使用する
+- YAML値とサーバー値の差異はwarningとして記録する
+- メタデータ取得不能、URL間のサーバー値不一致はエラーとする
+- `--dry-run` でもフェーズ1を実行し、失敗時は終了コード1とする
+
 ## 7. ハッシュ検証
 
 各パーツのハッシュを連結して全体ハッシュとみなしてはならない。
 全パーツの書き込み完了後、出力ファイルを先頭から一定サイズずつ読み、全体のSHA256を計算する。
 
-SHA256不一致の場合は成功扱いにせず、ロックファイルを残してエラー終了する。
+SHA256不一致の場合は成功扱いにせず、cleanなエラー終了時にはロックファイルを削除する。
+プロセス異常終了時に残ったロックファイルは、次回起動時にstale判定する。
 
 ## 8. バッファ制御
 
@@ -211,7 +235,13 @@ max_streams = floor(buffer_limit_bytes / (2 * io_chunk_size))
 --verbose
 ```
 
-`--category` 未指定時は全カテゴリを対象にする。YAMLの `disabled: true` は常にスキップする。
+`--category` はダウンロード対象カテゴリのホワイトリストである。
+
+- `--category sd15` は `sd15` だけを対象とする
+- `--category sd15,flux2` は指定された2カテゴリだけを対象とする
+- `--category` 未指定時は何もダウンロードしない
+- YAMLの `disabled: true` は常にスキップする
+- 未知のカテゴリ指定は設定ミスとして終了コード2にする
 
 ## 11. 既存環境変数
 
@@ -222,9 +252,39 @@ max_streams = floor(buffer_limit_bytes / (2 * io_chunk_size))
 - `CIVITAI_API_TOKEN`: 設定時のみCivitAI API/ダウンロードに付与
 - `CIVITAI_API_URL`: CivitAI APIの基底URL
 
-## 12. エラーと終了コード
+## 12. Google Drive
+
+### 12.1 対応方針
+
+Google Driveの大容量公開ファイルでは、通常のGETが「ウイルススキャンできません」確認ページのHTMLを返すことがある。
+`gdown` はこの確認ページを回避できるが、同期APIであり、内部で `.part` 一時ファイルを使用するため、本Downloaderへ直接組み込まない。
+
+Downloaderでは、gdownの実装を参考にしたasyncio対応のGoogle Drive URL resolverを使用する。
+
+- URLからファイルIDを抽出する
+- `drive.google.com/uc?id=<id>` にCookieを保持してアクセスする
+- `download-form`、hidden input、確認URL、`downloadUrl`を解析する
+- 確認URLへ再アクセスし、最終的なファイルURLを得る
+- 解決後のレスポンスを既存のストリーミング書き込みへ渡す
+
+### 12.2 Google Driveの適用範囲
+
+Google Drive URLは `type: split` で使用する。
+Google DriveのRange対応はサーバー仕様に依存するため、`type: range` では原則使用しない。
+`part-sizes` はGoogle Drive URLでは必須とする。HEADでサイズを取得できないことがあるためである。
+
+Google Driveの確認ページや最終URLに含まれるCookie・確認パラメータは、同一の `httpx.AsyncClient` 内で保持する。
+認証情報や確認用トークンをログへ出してはならない。
+
+### 12.3 Google Driveの再試行
+
+大容量ファイルでは接続が途中で終了する可能性がある。
+リトライ時は、可能なら既に受信した位置から残りのRangeを要求し、`Content-Range`を検証して出力位置へ追記する。
+Range再開に対応しない場合は、パーツ先頭から再取得する。
+
+## 13. エラーと終了コード
 
 - YAML形式不正、必須項目不足、サイズ不正: 終了コード2
 - HTTP、書き込み、Range検証、サイズ検証、SHA256検証失敗: 終了コード1
-- `--dry-run` はメタデータ解決と既存ファイル状態確認まで行い、ダウンロードしない
+- `--dry-run` はメタデータ解決と既存ファイル状態確認まで行い、ダウンロードしない。メタデータ失敗時は終了コード1
 - 一部ファイルだけ失敗した場合も、全体の終了コードは1

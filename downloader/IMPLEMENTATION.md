@@ -65,9 +65,15 @@ def parse_size(value: object) -> int
 - `part-sizes` の合計は正の整数
 - `sha256` は空または64桁16進数
 
-出力パスは `realpath(MODEL_DL_ROOT / dir / file)` を計算し、`MODEL_DL_ROOT` 配下であることを確認する。
+出力パスは `realpath(MODEL_DL_ROOT / models / dir / category / file)` を計算し、`MODEL_DL_ROOT` 配下であることを確認する。
 
 `disabled: true` のエントリは、メタデータ取得もダウンロードも行わない。
+
+カテゴリ選択はホワイトリスト方式とする。
+
+- `--category` 指定時は指定カテゴリだけを対象にする
+- `--category` 未指定時は対象カテゴリを空集合として、何もダウンロードしない
+- 未知カテゴリは終了コード2とする
 
 ### Step 3: AsyncClientの構成
 
@@ -82,20 +88,28 @@ APIと実データ取得で同じクライアントを使用する。タスク�
 
 ### Step 4: メタデータ解決
 
+ダウンロード前にフェーズ1として全対象のメタデータを解決する。
+解決結果はエントリへ正規化して保存し、後続の既存ファイル判定とダウンロードで同じ値を使う。
+`--dry-run` でもこのフェーズを実行し、解決失敗があれば終了コード1にする。
+
 #### range
 
-`filesize` が指定されていればそれを採用する。
-未指定なら、URLを解析してHF/CivitAIのAPI情報を試す。その後、先頭URLのHEADへフォールバックする。
+URLがHFまたはCivitAIの場合はAPI情報を取得する。取得できなければ各URLのHEADを試す。
+YAMLの `filesize` はサーバー情報が取得できない場合のfallbackとして使用する。
 
-APIで得たサイズが複数URLから取れる場合は一致確認する。不一致なら、そのファイルを開始しない。
+API/HEADで取得したサイズがYAMLの `filesize` と異なる場合はwarningを出し、サーバー値で続行する。
+API/HEADで取得したサイズが複数URL間で異なる場合は、同一ファイルを構成できないためエラーにする。
+SHA256も同様に、サーバーAPIの値を優先し、YAML値との差異はwarningとする。
 
 #### split
 
-`part-sizes` が指定されていれば採用する。
-未指定なら全URLへHEADを行い、各レスポンスの `Content-Length` を取得する。
-取得不能なパーツがあればエラーにする。
+各URLへHEADを行い、各レスポンスの `Content-Length` を優先する。
+HEADで取得できない場合だけYAMLの `part-sizes` をfallbackとして使用する。
+HEADの値がYAMLの `part-sizes` と異なる場合はwarningを出し、HEAD値で続行する。
+取得不能なパーツにYAML値もない場合はエラーにする。
 
 HEADの値は信頼しきらず、GET時の実受信バイト数を必ず検証する。
+フェーズ1で解決したサイズと、実際の受信バイト数が一致しない場合は失敗させる。
 
 #### HF API
 
@@ -121,7 +135,7 @@ YAMLの `sha256`、プロバイダAPIのSHA256、未検証の順とする。
 
 対象ファイルについて次を行う。
 
-1. 親ディレクトリを作成する。
+1. `MODEL_DL_ROOT/models/<dir>/<category>` の親ディレクトリを作成する。
 2. `<output>.download.json` を排他的に作成する。既存の場合は、同一プロセスの所有物でない限りエラーにする。
 3. 既存の出力ファイルがあれば、期待ハッシュがある場合だけ全体検証してスキップ判定する。
 4. ダウンロード対象なら出力ファイルを `w+b` で開く。失敗時に旧ファイルを保持する方式ではないため、開始前にこの挙動をログへ出す。
@@ -156,6 +170,40 @@ async def download_segment(
 11. 指数バックオフしてリトライする。
 
 受信処理をファイルロックの外で行い、書き込みだけをロック内に置くこと。
+
+`Accept-Encoding: identity` をsplit/rangeのGETとHEADに指定し、圧縮転送によるサイズ解釈の差を避ける。
+
+#### Google Drive resolver
+
+gdownをDownloaderから直接呼び出してはならない。gdownの同期APIはイベントループをブロックし、内部の `.part` 一時ファイルは本設計の制約に反する。
+
+gdownの確認ページ回避ロジックを参考に、`httpx.AsyncClient` 用のresolverを実装する。
+
+```python
+async def resolve_google_drive_url(
+    client: httpx.AsyncClient, url: str
+) -> str
+```
+
+処理:
+
+1. `drive.google.com`、`drive.usercontent.google.com`、`docs.google.com` のURLを検出する
+2. URLからGoogle DriveのファイルIDを抽出する
+3. Cookieを保持したまま `drive.google.com/uc?id=<id>` へアクセスする
+4. `Content-Disposition` があれば直接ファイルURLとして採用する
+5. HTMLの場合は `download-form`、hidden input、`downloadUrl`、確認用hrefを解析する
+6. hidden inputとCookieを保持して確認URLへ再アクセスする
+7. HTMLが再び返る場合は、最大回数を設定して解決を繰り返す
+8. 確認ページ、権限エラー、quota超過を区別して報告する
+
+HTML解析は標準ライブラリの `html.parser.HTMLParser` を優先し、gdownやBeautifulSoupを実行時依存にしない。
+解決用のHTML全体を無制限にメモリへ読み込まず、上限を設ける。
+
+Google Drive URLは `split` のみ正式対応とする。`range` でGoogle Drive URLが指定された場合は、Range対応を保証できないため事前にエラーにする。
+`part-sizes` がないGoogle Driveのsplitエントリは、HEAD不能に備えてエラーにする。
+
+大容量Google Driveでは接続が途中終了する可能性があるため、リトライ時は可能なら既受信位置から残りのRangeを要求する。
+Range再開に対応しない場合はパーツ先頭から再取得する。
 
 ### Step 7: split実装
 
@@ -238,20 +286,31 @@ HTTPサーバーが `200` を返した場合は失敗させる。
 5. 200応答を返すRange非対応サーバーの失敗
 6. 途中切断後のリトライが対象範囲を先頭から上書きすること
 7. サイズ超過・サイズ不足の失敗
-8. disabledカテゴリ、disabledエントリ、category絞り込み
-9. 既存ファイルのSHA256一致スキップ
-10. SHA256空欄時の `unverified` 警告
-11. HF_TOKENがある場合だけAuthorizationが付くこと
-12. CivitAIのfileIdで正しいファイルが選択されること
-13. `threading` や `concurrent.futures` がimportされていないこと
+8. category未指定時に何もダウンロードしないホワイトリスト動作
+9. disabledカテゴリ、disabledエントリ、category絞り込み
+10. 既存ファイルのSHA256一致スキップ
+11. サーバー値とYAML値の差異がwarningで継続されること
+12. サーバー値がURL間で異なる場合の失敗
+13. SHA256空欄時の `unverified` 警告
+14. HF_TOKENがある場合だけAuthorizationが付くこと
+15. CivitAI_TOKENがURLではなくAuthorizationヘッダに付くこと
+16. CivitAI_TOKENがログやURLへ漏れないこと
+17. CivitAIのfileIdで正しいファイルが選択されること
+18. Google Drive確認HTMLから最終URLを解決できること
+19. Google DriveのCookieとhidden inputを保持できること
+20. Google DriveのRange方式を拒否すること
+21. Google Drive接続切断後のRange再開または先頭再取得
+22. `threading` や `concurrent.futures` がimportされていないこと
 
-`--list` と `--dry-run` は、実データを取得せずにローカルのサンプル設定で実行できるようにする。
+`--list` は実データへアクセスせずにカテゴリと無効項目を表示する。
+`--dry-run` は実データ本体をダウンロードしないが、フェーズ1のメタデータ取得（API/HEAD/Google Drive resolver）と既存ファイル状態確認は実行する。
 
 ## 7. run_download.sh
 
 新実装では `huggingface_hub` と `littledl` をインストールしない。
-必要な依存は `httpx`, `pyyaml`, `python-dotenv`, `tqdm` とする。
+必要な依存は `httpx`, `pyyaml`, `tqdm` とする。
 `aiofiles` は厳密なスレッド不使用要件のため追加しない。
+`gdown` も直接使用しない。gdownの確認ページ回避ロジックだけをasyncio実装の参考にする。
 
 YAMLのデフォルトパスは、実際に使用する設定に合わせて `dl_model_list.yaml` とする。
-実行するPythonスクリプトの絶対パスも既存配置と一致させる。
+実行するPythonスクリプトのパスは `run_download.sh` 自身のディレクトリを基準にする。
