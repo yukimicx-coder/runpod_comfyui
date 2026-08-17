@@ -849,8 +849,12 @@ async def download_segment(
     progress: tqdm | None,
     retries: int = MAX_RETRIES,
     expected_total: int | None = None,
+    label: str = "",
 ) -> int:
     """Download a segment from url, writing at offset in output_path.
+
+    `label` identifies the segment (e.g. "cat/file#part3@offset") so logs for
+    parallel segments from the same/相似 host can be told apart.
 
     Returns the number of bytes written.
     Raises on failure after all retries exhausted.
@@ -875,17 +879,18 @@ async def download_segment(
                     request_url = await resolve_google_drive_url(client, url)
                     headers.setdefault("User-Agent", _GOOGLE_DRIVE_UA)
                     logger.info(
-                        "segment gdrive resolved %s -> %s",
-                        sanitize_url(url), sanitize_url(request_url),
+                        "segment[%s] gdrive resolved %s -> %s",
+                        label, sanitize_url(url), sanitize_url(request_url),
                     )
 
                 async with client.stream("GET", request_url, headers=headers) as resp:
                     resp.raise_for_status()
 
                     logger.debug(
-                        "segment GET status=%d url=%s ctype=%s clen=%s crange=%s",
-                        resp.status_code, sanitize_url(request_url),
-                        resp.headers.get("content-type"),
+                        "segment[%s] attempt=%d/%d url=%s status=%d ctype=%s "
+                        "clen=%s crange=%s",
+                        label, attempt + 1, retries, sanitize_url(request_url),
+                        resp.status_code, resp.headers.get("content-type"),
                         resp.headers.get("content-length"),
                         resp.headers.get("content-range"),
                     )
@@ -932,8 +937,8 @@ async def download_segment(
                         and content_length != expected_size
                     ):
                         logger.warning(
-                            "segment Content-Length %d != expected %d (%s)",
-                            content_length, expected_size, sanitize_url(url),
+                            "segment[%s] Content-Length %d != expected %d (%s)",
+                            label, content_length, expected_size, sanitize_url(url),
                         )
 
                     # Stream to file with seek
@@ -970,8 +975,8 @@ async def download_segment(
                                     )
                                 # All required bytes are on disk; do not wait for EOF.
                                 logger.debug(
-                                    "segment reached expected size %d (%s); closing stream",
-                                    expected_size, sanitize_url(url),
+                                    "segment[%s] reached expected size %d (%s); closing stream",
+                                    label, expected_size, sanitize_url(url),
                                 )
                                 break
 
@@ -984,28 +989,30 @@ async def download_segment(
 
             except SegmentSizeError as e:
                 logger.error(
-                    "segment size error (attempt %d/%d, received=%d) %s: %s",
-                    attempt + 1, retries, received, sanitize_url(url), e,
+                    "segment[%s] size error (attempt %d/%d, offset=%d, expected=%s, "
+                    "received=%d) %s: %s",
+                    label, attempt + 1, retries, offset, expected_size,
+                    received, sanitize_url(url), e,
                 )
                 raise  # deterministic error: do not retry
             except (httpx.HTTPStatusError, httpx.TransportError, ValueError) as e:
                 last_error = e
                 logger.warning(
-                    "segment download error (attempt %d/%d, expected=%s, received=%d) "
-                    "%s: %s",
-                    attempt + 1, retries, expected_size, received,
-                    sanitize_url(url), e,
+                    "segment[%s] download error (attempt %d/%d, offset=%d, "
+                    "expected=%s, received=%d) %s: %s",
+                    label, attempt + 1, retries, offset, expected_size,
+                    received, sanitize_url(url), e,
                 )
                 if attempt < retries - 1:
                     wait = RETRY_BACKOFF ** (attempt + 1)
                     logger.info(
-                        "segment retry in %ds (attempt %d/%d): %s",
-                        wait, attempt + 1, retries, sanitize_url(url),
+                        "segment[%s] retry in %ds (attempt %d/%d): %s",
+                        label, wait, attempt + 1, retries, sanitize_url(url),
                     )
                     await asyncio.sleep(wait)
 
         raise RuntimeError(
-            f"Failed to download segment after {retries} attempts: {url}"
+            f"Failed to download segment [{label}] after {retries} attempts: {url}"
         ) from last_error
 
 
@@ -1067,11 +1074,12 @@ async def download_split_entry(
         try:
             async with asyncio.TaskGroup() as tg:
                 for i, (url, offset, size) in enumerate(zip(urls, offsets, entry["part-sizes"])):
+                    label = f"{entry.get('category','?')}/{entry['file']}#part{i}@off{offset}"
                     tg.create_task(
                         download_segment(
                             client, url, output_path, write_lock,
                             offset, size, None, global_semaphore,
-                            pbar, MAX_RETRIES,
+                            pbar, MAX_RETRIES, label=label,
                         ),
                         name=f"split-{entry['file']}-part{i}",
                     )
@@ -1179,6 +1187,7 @@ async def download_range_entry(
                             client, url, output_path, write_lock,
                             start, size, extra_headers, global_semaphore,
                             pbar, MAX_RETRIES, expected_total=entry["filesize"],
+                            label=f"{entry.get('category','?')}/{entry['file']}#chunk{i}@off{start}",
                         ),
                         name=f"range-{entry['file']}-chunk{i}",
                     )
