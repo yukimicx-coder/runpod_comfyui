@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import hashlib
+import html.parser
 import json
 import logging
 import os
@@ -10,7 +11,7 @@ import re
 import sys
 import time
 import traceback
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import httpx
 import yaml
@@ -32,9 +33,9 @@ CIVITAI_API_URL = os.environ.get(
 # Constants
 # ---------------------------------------------------------------------------
 MODELS_ROOT = os.path.join(DL_ROOT, "models")
-IO_CHUNK_SIZE = 64 * 1024 * 1024          # 64 MiB per recv chunk
-DEFAULT_BUFFER_LIMIT = 512 * 1024 * 1024   # 512 MiB
+IO_CHUNK_SIZE = 64 * 1024 * 1024          # 64 MiB (hash read, internal use only)
 DEFAULT_CHUNK_SIZE = 1 * 1024 * 1024 * 1024  # 1 GiB for range type
+DEFAULT_MAX_CONCURRENT = 4                # simultaneous download connections
 MAX_RETRIES = 3
 RETRY_BACKOFF = 2  # seconds, exponential
 DOWNLOAD_META_SUFFIX = ".download.json"
@@ -141,6 +142,179 @@ def parse_civitai_url(url: str) -> tuple[str, str | None] | None:
 
 
 # ---------------------------------------------------------------------------
+# Google Drive URL helpers
+# ---------------------------------------------------------------------------
+_GOOGLE_DRIVE_HOSTS = {
+    "drive.google.com",
+    "drive.usercontent.google.com",
+    "drive.googleusercontent.com",
+    "docs.google.com",
+}
+_GOOGLE_DRIVE_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_1) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/39.0.2171.95 Safari/537.36"
+)
+_GDRIVE_HTML_LIMIT = 4 * 1024 * 1024  # read at most 4 MiB of confirmation HTML
+_GDRIVE_UC_URL = "https://drive.google.com/uc?id={file_id}"
+_GDRIVE_BASE = "https://docs.google.com"
+
+
+def is_google_drive_url(url: str) -> bool:
+    """Return True if url points to a Google Drive host."""
+    host = urlparse(url).hostname or ""
+    return any(host == h or host.endswith("." + h) for h in _GOOGLE_DRIVE_HOSTS)
+
+
+def parse_google_drive_url(url: str) -> str | None:
+    """Extract a Google Drive file ID from a URL, or None."""
+    parsed = urlparse(url)
+    if not is_google_drive_url(url):
+        return None
+    qs = parse_qs(parsed.query)
+    if "id" in qs:
+        return qs["id"][0]
+    # /file/d/<FILE_ID>/view  (drive.google.com)
+    m = re.search(r"/file/d/([^/]+)/", parsed.path)
+    if m:
+        return m.group(1)
+    # /uc?export=download&id=... or /open?id=...
+    m = re.search(r"[\?&]id=([^&\s]+)", url)
+    if m:
+        return m.group(1)
+    return None
+
+
+class _GDriveFormParser(html.parser.HTMLParser):
+    """Extract the confirmation form, hidden inputs, and download link."""
+
+    def __init__(self):
+        super().__init__()
+        self.form_action: str | None = None
+        self.hidden_inputs: dict[str, str] = {}
+        self.download_href: str | None = None
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "form" and attrs.get("id") == "download-form":
+            self.form_action = attrs.get("action")
+        elif tag == "input":
+            if attrs.get("type") == "hidden" and attrs.get("name"):
+                self.hidden_inputs[attrs["name"]] = attrs.get("value", "")
+        elif tag == "a":
+            href = attrs.get("href") or ""
+            if "/uc?export=download" in href:
+                self.download_href = href
+
+
+def _parse_gdrive_page(
+    html: str,
+) -> tuple[str | None, str | None, str | None, dict[str, str]]:
+    """Parse a Google Drive confirmation page.
+
+    Returns (download_url, error_msg, form_action, hidden_inputs).
+    Only one of download_url/error_msg/form_action is set.
+    """
+    # "downloadUrl":"..." embedded in a script tag
+    m = re.search(r'"downloadUrl"\s*:\s*"([^"]+)"', html)
+    if m:
+        u = (
+            m.group(1)
+            .replace("\\u003d", "=")
+            .replace("\\u0026", "&")
+            .replace("\\/", "/")
+        )
+        return u, None, None, {}
+
+    parser = _GDriveFormParser()
+    parser.feed(html)
+    if parser.download_href:
+        return _GDRIVE_BASE + parser.download_href, None, None, {}
+    m = re.search(r'<p class="uc-error-subcaption">(.*?)</p>', html, re.S)
+    if m:
+        return None, m.group(1).strip(), None, {}
+    if parser.form_action:
+        return None, None, parser.form_action, parser.hidden_inputs
+    return None, None, None, {}
+
+
+async def _read_limited(resp: httpx.Response, limit: int) -> str:
+    """Read at most `limit` bytes from a streaming response as text."""
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in resp.aiter_bytes():
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > limit:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks).decode("utf-8", errors="replace")
+
+
+async def resolve_google_drive_url(
+    client: httpx.AsyncClient, url: str, max_redirects: int = 5
+) -> str:
+    """Resolve a Google Drive URL to a direct download URL.
+
+    Skips the "virus scan cannot confirm" page by parsing the confirmation
+    form / hidden inputs / downloadUrl, and returns the effective URL that
+    serves the file body. Cookies are shared through the AsyncClient.
+    """
+    file_id = parse_google_drive_url(url)
+    if not file_id:
+        raise ValueError(
+            f"Cannot extract Google Drive file ID from {sanitize_url(url)}"
+        )
+
+    current = _GDRIVE_UC_URL.format(file_id=file_id)
+    headers = {"User-Agent": _GOOGLE_DRIVE_UA, "Accept-Encoding": "identity"}
+    logger.debug("gdrive resolve start id=%s url=%s", file_id, sanitize_url(url))
+
+    for step in range(max_redirects):
+        async with client.stream("GET", current, headers=headers) as resp:
+            resp.raise_for_status()
+            ctype = resp.headers.get("content-type") or ""
+            logger.debug(
+                "gdrive step %d status=%d url=%s ctype=%s cd=%s clen=%s",
+                step, resp.status_code, sanitize_url(current), ctype,
+                resp.headers.get("content-disposition"),
+                resp.headers.get("content-length"),
+            )
+            # The actual file: has Content-Disposition, or is not HTML.
+            if "content-disposition" in resp.headers or "text/html" not in ctype:
+                logger.debug(
+                    "gdrive step %d -> file response, effective url=%s",
+                    step, sanitize_url(str(resp.url)),
+                )
+                return str(resp.url)
+            html = await _read_limited(resp, _GDRIVE_HTML_LIMIT)
+
+        download_url, error, form_action, hidden = _parse_gdrive_page(html)
+        logger.debug(
+            "gdrive step %d html len=%d download_url=%s error=%r form_action=%r hidden=%s",
+            step, len(html), sanitize_url(download_url or ""), error,
+            form_action, sorted(hidden.keys()),
+        )
+        if error:
+            raise RuntimeError(f"Google Drive: {error}")
+        if download_url:
+            return download_url
+        if form_action:
+            if not form_action.startswith("http"):
+                form_action = _GDRIVE_BASE + form_action
+            parsed = urlparse(form_action)
+            qs = parse_qs(parsed.query)
+            for k, v in hidden.items():
+                qs[k] = [v]
+            current = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+            continue
+        raise RuntimeError("Google Drive confirmation page could not be resolved")
+
+    raise RuntimeError("Google Drive URL resolution exceeded the redirect limit")
+
+
+# ---------------------------------------------------------------------------
 # YAML validation
 # ---------------------------------------------------------------------------
 def validate_entry(entry: dict, category: str, index: int) -> list[str]:
@@ -178,6 +352,10 @@ def validate_entry(entry: dict, category: str, index: int) -> list[str]:
             errors.append(f"{tag} sha256 must be 64 hex chars or empty, got {sha256!r}")
 
     if entry_type == "range":
+        if any(is_google_drive_url(u) for u in urls if isinstance(u, str)):
+            errors.append(
+                f"{tag} Google Drive URLs are not supported for type 'range'"
+            )
         filesize = entry.get("filesize")
         if filesize is not None and filesize != "":
             try:
@@ -185,6 +363,11 @@ def validate_entry(entry: dict, category: str, index: int) -> list[str]:
             except ValueError as e:
                 errors.append(f"{tag} filesize: {e}")
     elif entry_type == "split":
+        if any(is_google_drive_url(u) for u in urls if isinstance(u, str)):
+            if not entry.get("part-sizes"):
+                errors.append(
+                    f"{tag} 'part-sizes' is required for Google Drive split URLs"
+                )
         part_sizes = entry.get("part-sizes")
         url_count = len(urls) if urls else 0
         if part_sizes is not None:
@@ -209,7 +392,7 @@ def load_and_validate_yaml(yaml_path: str | None) -> dict[str, list[dict]]:
     """Load YAML, validate, filter by category.
 
     Returns {category: [entry, ...]} with 'category' and 'index' keys added.
-    Raises SystemExit on validation errors.
+    Raises ValueError on validation errors.
     """
     if not os.path.isfile(yaml_path):
         raise FileNotFoundError(yaml_path)
@@ -265,6 +448,7 @@ _SENSITIVE_QUERY_KEYS = {
     "token", "key", "api_key", "apikey", "auth", "signature",
     "sig", "x-api-key", "X-Amz-Signature", "X-Amz-Credential",
     "X-Amz-Security-Token",
+    "confirm", "uuid", "at",
 }
 
 
@@ -422,13 +606,19 @@ async def validate_file_size_and_hash(
 
     Size priority: provider API > HEAD > YAML filesize.
     SHA priority: provider API sha > YAML sha256.
-    results are written to entry["filesize] and entry["sha256"]. Raises ValueError if size cannot be
-    determined, or if provider-reported sizes conflict with the YAML value.
+    Results are written to entry["filesize"] and entry["sha256"].
+    YAML values are treated as reference values: when the server reports a
+    different size/hash, a warning is logged and the server value is used.
+    Raises ValueError if the size cannot be determined, or if server values
+    conflict across multiple URLs.
     """
     assert entry["type"] == "range"
 
-    yaml_size = entry.get("filesize")
-    yaml_sha = entry.get("sha256","").lower()
+    yaml_size_raw = entry.get("filesize")
+    yaml_size = (
+        parse_size(yaml_size_raw) if yaml_size_raw not in (None, "") else None
+    )
+    yaml_sha = (entry.get("sha256") or "").lower()
 
     api_sizes: list[int] = []
     api_shas: list[str] = []
@@ -444,61 +634,57 @@ async def validate_file_size_and_hash(
         if sha:
             api_shas.append(sha)
 
+    server_size: int | None = None
     if api_sizes:
-        if any([s != api_sizes[0] for s in api_sizes]):
+        if any(s != api_sizes[0] for s in api_sizes):
             raise ValueError(
-                f"Provider size mismatch for {entry['file']}: "
-                f"API reports different sizes {api_sizes}"
+                f"API reports different sizes for {entry['file']}: {api_sizes}"
             )
-        if yaml_size and yaml_size != api_sizes[0]:
-            raise ValueError(
-                f"Provider size mismatch for {entry['file']}: "
-                f"YAML says {yaml_size}, API reports {api_sizes}"
-            )
-
-        entry["filesize"] = size
+        server_size = api_sizes[0]
     else:
-        header_sizes = []
+        header_sizes: list[int] = []
         for url in entry["urls"]:
-            size = await _head_content_length(client, url)
-            if size:
-                header_sizes.append(size)
-
-        if not header_sizes:
-            if yaml_size is None:
-                raise ValueError(
-                    f"Cannot determine total file size for {entry['file']} from header"
-                )
-        else:
+            cl = await _head_content_length(client, url)
+            if cl:
+                header_sizes.append(cl)
+        if header_sizes:
             if any(s != header_sizes[0] for s in header_sizes):
                 raise ValueError(
-                    f"header sizes differ for {entry['file']}: {header_sizes}"
+                    f"HEAD reports different sizes for {entry['file']}: {header_sizes}"
                 )
-            if yaml_size and yaml_size != header_sizes[0]:
-                raise ValueError(
-                    f"Provider size mismatch for {entry['file']}: "
-                    f"YAML says {yaml_size}, Header reports {header_sizes[0]}"
-                )
+            server_size = header_sizes[0]
 
-            entry["filesize"] = header_sizes[0]
+    if server_size is not None:
+        if yaml_size is not None and yaml_size != server_size:
+            logger.warning(
+                "filesize mismatch for %s: YAML=%d server=%d (using server value)",
+                entry["file"], yaml_size, server_size,
+            )
+        entry["filesize"] = server_size
+    else:
+        if yaml_size is None:
+            raise ValueError(
+                f"Cannot determine total file size for {entry['file']}"
+            )
+        entry["filesize"] = yaml_size
 
     if api_shas:
-        if any([h != api_shas[0] for h in api_shas]):
+        if any(h != api_shas[0] for h in api_shas):
             raise ValueError(
-                f"Provider hash mismatch for {entry['file']}: "
-                f"API reports different hases {api_shas}"
+                f"API reports different SHA256 for {entry['file']}: {api_shas}"
             )
-        if yaml_sha and yaml_sha != api_shas[0]:
-            raise ValueError(
-                f"Provider size mismatch for {entry['file']}: "
-                f"YAML says {yaml_sha}, API reports {api_shas}"
+        server_sha = api_shas[0]
+        if yaml_sha and yaml_sha != server_sha:
+            logger.warning(
+                "sha256 mismatch for %s: YAML=%s server=%s (using server value)",
+                entry["file"], yaml_sha, server_sha,
             )
+        entry["sha256"] = server_sha
+    else:
+        entry["sha256"] = yaml_sha
 
-        entry["sha256"] = api_shas[0]
-
-    if "sha256" not in entry:
-        logger.warning(f"sha256 for {entry['file']} is not specified")
-        entry["sha256"] = ""
+    if not entry["sha256"]:
+        logger.warning("sha256 for %s is not specified", entry["file"])
 
 
 async def resolve_split_sizes(
@@ -506,21 +692,40 @@ async def resolve_split_sizes(
 ):
     """Resolve part sizes for a split entry.
 
-    Returns list of part sizes in bytes.
+    Priority per URL: HEAD Content-Length > YAML part-sizes (fallback).
+    Writes entry["part-sizes"] as a list of int.
+    When HEAD value differs from YAML, a warning is logged and HEAD is used.
+    Raises ValueError if a part's size cannot be determined.
     """
-    part_sizes_raw = entry.get("part-sizes")
-    if part_sizes_raw is not None:
-        entry["part-sizes"] = [parse_size(ps) for ps in part_sizes_raw]
-        return
+    yaml_sizes: list[int] | None = None
+    if entry.get("part-sizes") is not None:
+        yaml_sizes = [parse_size(ps) for ps in entry["part-sizes"]]
 
-    # HEAD fallback for each URL
     sizes: list[int] = []
-    for url in entry["urls"]:
+    for i, url in enumerate(entry["urls"]):
+        if is_google_drive_url(url):
+            # HEAD is unreliable for Google Drive; 'part-sizes' is required.
+            if yaml_sizes is None or i >= len(yaml_sizes):
+                raise ValueError(
+                    f"Cannot determine part size for Google Drive URL: {url} "
+                    f"('part-sizes' is required)"
+                )
+            sizes.append(yaml_sizes[i])
+            continue
         cl = await _head_content_length(client, url)
         if cl is None:
+            if yaml_sizes is not None and i < len(yaml_sizes):
+                sizes.append(yaml_sizes[i])
+                continue
             raise ValueError(
                 f"Cannot determine part size for URL: {url} "
                 f"(HEAD returned no Content-Length)"
+            )
+        if yaml_sizes is not None and i < len(yaml_sizes) and yaml_sizes[i] != cl:
+            logger.warning(
+                "part-sizes mismatch for %s part %d: YAML=%d HEAD=%d "
+                "(using HEAD value)",
+                entry["file"], i, yaml_sizes[i], cl,
             )
         sizes.append(cl)
 
@@ -610,6 +815,7 @@ def check_existing(output_path: str, entry:dict) -> bool:
             return False
 
     if "sha256" in entry:
+        logger.info("start to check hash... %s", output_path)
         result = verify_sha256(output_path, entry["sha256"])
         if result == "verified":
             logger.info("Skip (hash match): %s", output_path)
@@ -623,6 +829,14 @@ def check_existing(output_path: str, entry:dict) -> bool:
 # ---------------------------------------------------------------------------
 # Common segment download
 # ---------------------------------------------------------------------------
+class SegmentSizeError(ValueError):
+    """Deterministic size/format error from the response.
+
+    Retrying cannot succeed because the same URL yields the same body.
+    These errors must NOT be retried.
+    """
+
+
 async def download_segment(
     client: httpx.AsyncClient,
     url: str,
@@ -654,48 +868,90 @@ async def download_segment(
                 # Auth via header (never put tokens in the URL)
                 headers.update(_auth_headers(url))
 
-                async with client.stream("GET", url, headers=headers) as resp:
+                # Google Drive: resolve the confirmation page first
+                request_url = url
+                gdrive = is_google_drive_url(url)
+                if gdrive:
+                    request_url = await resolve_google_drive_url(client, url)
+                    headers.setdefault("User-Agent", _GOOGLE_DRIVE_UA)
+                    logger.info(
+                        "segment gdrive resolved %s -> %s",
+                        sanitize_url(url), sanitize_url(request_url),
+                    )
+
+                async with client.stream("GET", request_url, headers=headers) as resp:
                     resp.raise_for_status()
 
-                    # Validate range response
+                    logger.debug(
+                        "segment GET status=%d url=%s ctype=%s clen=%s crange=%s",
+                        resp.status_code, sanitize_url(request_url),
+                        resp.headers.get("content-type"),
+                        resp.headers.get("content-length"),
+                        resp.headers.get("content-range"),
+                    )
+
+                    # Validate range response (deterministic: no retry)
                     if "Range" in headers:
                         if resp.status_code != 206:
-                            raise ValueError(
+                            raise SegmentSizeError(
                                 f"Expected 206 for Range request, got {resp.status_code}"
                             )
                         cr = resp.headers.get("content-range", "")
-                        # Format: bytes start-end/total
                         cr_match = re.match(r"bytes (\d+)-(\d+)/(\d+)", cr)
                         if not cr_match:
-                            raise ValueError(f"Missing or invalid Content-Range: {cr!r}")
+                            raise SegmentSizeError(
+                                f"Missing or invalid Content-Range: {cr!r}"
+                            )
                         cr_start = int(cr_match.group(1))
                         cr_end = int(cr_match.group(2))
                         cr_total = int(cr_match.group(3))
                         if cr_start != offset:
-                            raise ValueError(
+                            raise SegmentSizeError(
                                 f"Content-Range start mismatch: expected {offset}, got {cr_start}"
                             )
                         expected_chunk = cr_end - cr_start + 1
                         if expected_size is not None and expected_chunk != expected_size:
-                            raise ValueError(
+                            raise SegmentSizeError(
                                 f"Content-Range chunk size mismatch: expected {expected_size}, got {expected_chunk}"
                             )
                         if expected_total is not None and cr_total != expected_total:
-                            raise ValueError(
+                            raise SegmentSizeError(
                                 f"Content-Range total mismatch: expected {expected_total}, got {cr_total}"
                             )
+
+                    # Content-Length hint for early detection (diagnostic + guard)
+                    content_length: int | None = None
+                    try:
+                        content_length = int(resp.headers.get("content-length"))
+                    except (TypeError, ValueError):
+                        content_length = None
+                    if (
+                        content_length is not None
+                        and "Range" not in headers
+                        and expected_size is not None
+                        and content_length != expected_size
+                    ):
+                        logger.warning(
+                            "segment Content-Length %d != expected %d (%s)",
+                            content_length, expected_size, sanitize_url(url),
+                        )
 
                     # Stream to file with seek
                     received = 0
                     with open(output_path, "r+b") as f:
-                        async for chunk in resp.aiter_bytes(chunk_size=IO_CHUNK_SIZE):
+                        # NOTE: aiter_bytes() with no chunk_size returns each
+                        # network chunk as it arrives, so we can stop promptly
+                        # when expected_size is reached. Passing a large
+                        # chunk_size would make httpx buffer up to that many
+                        # bytes before yielding, delaying the stop.
+                        async for chunk in resp.aiter_bytes():
                             if not chunk:
                                 continue
                             chunk_len = len(chunk)
                             if expected_size is not None and received + chunk_len > expected_size:
-                                raise ValueError(
-                                    f"Received {received + chunk_len} bytes, "
-                                    f"expected {expected_size} max"
+                                raise SegmentSizeError(
+                                    f"oversize: received {received + chunk_len} "
+                                    f"bytes, expected {expected_size} max"
                                 )
                             async with write_lock:
                                 f.seek(offset + received)
@@ -703,22 +959,49 @@ async def download_segment(
                             received += chunk_len
                             if progress:
                                 progress.update(chunk_len)
+                            if expected_size is not None and received == expected_size:
+                                if (
+                                    content_length is not None
+                                    and content_length > expected_size
+                                ):
+                                    raise SegmentSizeError(
+                                        f"Content-Length {content_length} exceeds "
+                                        f"expected {expected_size}"
+                                    )
+                                # All required bytes are on disk; do not wait for EOF.
+                                logger.debug(
+                                    "segment reached expected size %d (%s); closing stream",
+                                    expected_size, sanitize_url(url),
+                                )
+                                break
 
                     if expected_size is not None and received != expected_size:
-                        raise ValueError(
-                            f"Incomplete download: got {received}, expected {expected_size}"
+                        raise SegmentSizeError(
+                            f"incomplete: got {received} bytes, expected {expected_size}"
                         )
 
                     return received  # success
 
+            except SegmentSizeError as e:
+                logger.error(
+                    "segment size error (attempt %d/%d, received=%d) %s: %s",
+                    attempt + 1, retries, received, sanitize_url(url), e,
+                )
+                raise  # deterministic error: do not retry
             except (httpx.HTTPStatusError, httpx.TransportError, ValueError) as e:
                 last_error = e
                 logger.warning(
-                    "Segment download error (attempt %d/%d) %s: %s",
-                    attempt + 1, retries, sanitize_url(url), e,
+                    "segment download error (attempt %d/%d, expected=%s, received=%d) "
+                    "%s: %s",
+                    attempt + 1, retries, expected_size, received,
+                    sanitize_url(url), e,
                 )
                 if attempt < retries - 1:
                     wait = RETRY_BACKOFF ** (attempt + 1)
+                    logger.info(
+                        "segment retry in %ds (attempt %d/%d): %s",
+                        wait, attempt + 1, retries, sanitize_url(url),
+                    )
                     await asyncio.sleep(wait)
 
         raise RuntimeError(
@@ -746,6 +1029,14 @@ async def download_split_entry(
     for ps in entry["part-sizes"]:
         offsets.append(acc)
         acc += ps
+
+    logger.debug(
+        "split parts: %s",
+        [
+            {"i": i, "url": sanitize_url(u), "offset": o, "size": s}
+            for i, (u, o, s) in enumerate(zip(urls, offsets, entry["part-sizes"]))
+        ],
+    )
 
     # Prepare output file
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -939,12 +1230,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Default chunk size for range type (default: {DEFAULT_CHUNK_SIZE})"
     )
     g.add_argument(
-        "--buffer-limit", default=str(DEFAULT_BUFFER_LIMIT), type=str,
-        help=f"Max buffer in bytes (default: {DEFAULT_BUFFER_LIMIT})"
-    )
-    g.add_argument(
-        "--max-concurrent", default=None, type=int,
-        help="Override max concurrent streams (clamped by buffer limit)"
+        "--max-concurrent", default=DEFAULT_MAX_CONCURRENT, type=int,
+        help=f"Max simultaneous download connections (default: {DEFAULT_MAX_CONCURRENT})"
     )
     return p
 
@@ -958,7 +1245,7 @@ async def main_async(args: argparse.Namespace) -> int:
         yaml_data = load_and_validate_yaml(MODEL_DL_LIST)
     except Exception as e:
         logger.error("failed to load YAML: %s: %s", e.__class__.__name__, e)
-        return 1
+        return 2
 
     # List mode
     if args.list:
@@ -982,75 +1269,87 @@ async def main_async(args: argparse.Namespace) -> int:
 
     io_chunk_size = IO_CHUNK_SIZE
 
-    # Parse size params
+    # Parse chunk size
     try:
-        buffer_limit = parse_size(args.buffer_limit)
         default_chunk_size = parse_size(args.chunk_size)
     except ValueError as e:
         logger.error("Invalid size argument: %s", e)
         return 2
 
-    # Calculate max streams from buffer limit
-    max_streams_from_buffer = buffer_limit // (2 * io_chunk_size)
-    if max_streams_from_buffer < 1:
-        logger.error(
-            "Buffer limit too small: %d bytes (need at least %d)",
-            buffer_limit, 2 * io_chunk_size,
-        )
+    if args.max_concurrent < 1:
+        logger.error("--max-concurrent must be >= 1, got %d", args.max_concurrent)
         return 2
-
-    if args.max_concurrent is not None:
-        if args.max_concurrent < 1:
-            logger.error("--max-concurrent must be >= 1, got %d", args.max_concurrent)
-            return 2
-        max_streams = min(args.max_concurrent, max_streams_from_buffer)
-    else:
-        max_streams = max_streams_from_buffer
+    max_streams = args.max_concurrent
 
     logger.info(
-        "Config: buffer_limit=%d MiB, chunk_size=%d MiB, max_streams=%d",
-        buffer_limit // (1024**2),
+        "Config: chunk_size=%d MiB, max_concurrent=%d",
         default_chunk_size // (1024**2),
         max_streams,
     )
 
     # Phase1: getting file info only
-
-    get_info_failures = 0
+    metadata_failures = 0
+    metadata_ok: list[dict] = []
 
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(connect=30, read=300, write=30, pool=30),
         follow_redirects=True,
         limits=httpx.Limits(max_connections=max_streams, max_keepalive_connections=4),
     ) as client:
-        # Resolve metadata to confirm downloads are possible
-        for entry in [entry for v in selected.values() for entry in v]:
-            try:
-                if entry["type"] == "range":
-                    await validate_file_size_and_hash(client, entry)
-                    info = (
-                        f"size={entry["filesize"]:,} "
-                        f"sha={'available' if entry["sha256"] else 'unavailable'}"
-                    )
-                else:
-                    await resolve_split_sizes(client, entry)
-                    entry["filesize"] = sum(entry['part-sizes'])
-                    info = f"size={entry['filesize']:,} parts={len(entry['part-sizes'])}"
-            except Exception as e:
-                info = f"ERROR: {e}"
-                logger.error(traceback.format_exc())
-                get_info_failures += 1
-            logger.info(
-                "  [%s] %s: %s (%s)",
-                entry["category"], entry["type"],
-                entry["file"], info,
-            )
+        # Resolve metadata to confirm downloads are possible (in parallel)
+        async def _resolve_metadata(entry: dict) -> dict:
+            if entry["type"] == "range":
+                await validate_file_size_and_hash(client, entry)
+                info = (
+                    f"size={entry["filesize"]:,} "
+                    f"sha={'available' if entry["sha256"] else 'unavailable'}"
+                )
+            else:
+                await resolve_split_sizes(client, entry)
+                entry["filesize"] = sum(entry['part-sizes'])
+                info = f"size={entry['filesize']:,} parts={len(entry['part-sizes'])}"
+            return entry, info
+
+        all_entries = [entry for v in selected.values() for entry in v]
+        results = await asyncio.gather(
+            *[_resolve_metadata(e) for e in all_entries],
+            return_exceptions=True,
+        )
+
+        for entry, result in zip(all_entries, results):
+            if isinstance(result, Exception):
+                metadata_failures += 1
+                logger.error(
+                    "  [%s] %s: %s — ERROR: %s",
+                    entry["category"], entry["type"],
+                    entry["file"], result,
+                )
+            else:
+                _, info = result
+                logger.info(
+                    "  [%s] %s: %s (%s)",
+                    entry["category"], entry["type"],
+                    entry["file"], info,
+                )
+                metadata_ok.append(entry)
+
+    if metadata_failures > 0:
+        logger.error(
+            "Metadata resolution failed for %d file(s). Aborting download.",
+            metadata_failures,
+        )
+        return 1
+
+    # Group metadata-ok entries by category (only these proceed to phase2)
+    ok_by_cat: dict[str, list[dict]] = {}
+    for entry in metadata_ok:
+        ok_by_cat.setdefault(entry["category"], []).append(entry)
 
     # Resolve output paths for checking existing files
     to_download: list[dict] = []
     to_skip: list[dict] = []
     total_size = 0
-    for cat, entries in selected.items():
+    for cat, entries in ok_by_cat.items():
         for entry in entries:
             try:
                 output_path = resolve_output_path(entry, cat)
@@ -1080,7 +1379,7 @@ async def main_async(args: argparse.Namespace) -> int:
     if args.dry_run:
         for dl in to_download:
             logger.info("downloaded: %s (%.1f GiB)", dl["_output_path"], dl["filesize"]/(1024.0**3))
-        return 3 if get_info_failures else 0
+        return 0
 
     # Phase2: download files
 

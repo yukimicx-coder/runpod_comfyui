@@ -1,42 +1,50 @@
 sd15:
-  disabled: false
-  files: 
-    - type: civitai
-      version-id: 2681234
-      file-index: 1
-      ldir: checkpoints
-      comment: Cyberrealistic Final
+  - type: range
+    disabled: false
+    dir: checkpoints
+    file: cyberrealistic_final.safetensors
+    urls:
+      - https://civitai.com/api/download/models/2681234?fileId=2567874
+      - https://huggingface.co/Brandon0922/cyberrealistic_final.safetensors/resolve/main/cyberrealistic_final.safetensors
 
-    - type: hf
-      repo: latent-consistency/lcm-lora-sdv1-5
-      file: pytorch_lora_weights.safetensors
-      ldir: loras
-      lfile: sd15_lcm_lora.safetensors
+  - type: range
+    disabled: true
+    dir: checkpoints
+    file: stable_diffusion_v1.5.safetensors
+    urls:
+      - https://civitai.com/api/download/models/****?fileId=****
+      - https://huggingface.co/****/****/resolve/main/stable_diffusion_v1.5.safetensors
+
 
 flux2:
-  disabled: false
-  files:
-    - type: civitai
-      version-id: 2658598
-      ldir: diffusion_models
-      lfile: flux-2-klein-9b-fp8.safetensors
+  - type: range
+    disabled: false
+    dir: diffusion_models
+    file: FLUX-2-Klein-9B_fp8.safetensors
+    sha256: 865ba09f5b4c3cbd3468a4bd3acb9fcb2f8740c54317482f0bcd4ed1d3655cee
+    filesize: 9433061528
+    urls:
+      - https://civitai.com/api/download/models/2658598?fileId=2545829
+      - https://huggingface.co/black-forest-labs/FLUX.2-klein-9b-fp8/resolve/main/flux-2-klein-9b-fp8.safetensors
+
 
 
 krea2:
-  disabled: true
-  files:
-    - type: hf
-      repo: Comfy-Org/Krea-2
-      subdir: diffusion_models
-      file: krea2_turbo_fp8_scaled.safetensors
-      ldir: diffusion_models
-
-ltx23:
-  disabled: true
-  files:
-    - type: hf
-      repo: Kijai/LTX2.3_comfy
-      subdir: diffusion_models
-      file: ltx-2.3-22b-distilled-1.1_transformer_only_fp8_scaled.safetensors
-      ldir: diffusion_models
+  - type: split
+    disabled: false
+    dir: diffusion_models
+    file: Krea2_HDv1_w4a8.safetensors
+    sha256: 509ab92b17556b3e5370abea2f2b236af8155c3a74fe0fbdfdd3e129ff47546e
+    urls:
+      - https://1drv.ms/u/c/*****?e=***&download=1
+      - https://drive.usercontent.google.com/download?id=****
+      - https://drive.usercontent.google.com/download?id=****
+      - https://1drv.ms/u/c/*****?e=***&download=1
+      - https://drive.usercontent.google.com/download?id=****
+    part-sizes:
+      - 2,000,000,000
+      - 2,000,000,000
+      - 2,000,000,000
+      - 2,000,000,000
+      - 2,841,272
 
