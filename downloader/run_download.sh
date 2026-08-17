@@ -1,16 +1,8 @@
 #!/bin/bash
 
-if [ -z "$MODEL_DL_AUTOSTART" ] || [ "$MODEL_DL_AUTOSTART" -eq 0 ]; then
-    exit 0
-fi
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if [ ! -f "${MODEL_DL_LIST:=/workspace/models/dl_list.yaml}" ]; then
-    echo "$MODEL_DL_LIST is missing"
-    exit 1
-fi
+uv pip install --system httpx pyyaml tqdm
 
-uv pip install --system huggingface_hub pyyaml httpx python-dotenv littledl
+python "$SCRIPT_DIR/download.py" $MODEL_DL_ARGS
 
-python ~/download.py $MODEL_DL_ARGS
-
-exit 0

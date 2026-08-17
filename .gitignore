@@ -3,3 +3,4 @@ archive/
 test/client/ssh/
 
 workspace_for_sync/
+downloader/dl_model_list.yaml
